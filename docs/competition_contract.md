@@ -1,0 +1,11 @@
+# LifeMate competition contract, checked 2026-11-04
+
+Sources: [official LifeMate portal](https://challenge.zalo.ai/portal/lifemate), [competition homepage](https://challenge.zalo.ai/), and the organizer's local `data/train+public_test/README.md`, `VERSION`, split catalogs, `zaic_tools/{__init__,executor,validate,utils}.py`, and sample submission. The portal's interactive Evaluation, Data, Rule, and Submission Guidance tabs could not be read through the available web view, so their current contents remain unverified.
+
+The local kit is v3.2.0, built 2026-10-24, with 1,545 TRAIN and 634 PUBLIC_TEST records. TRAIN contains `audio_text`, `label.tool_calls`, `label.tool_results`, and `label.final_state`; PUBLIC_TEST contains none of those. Both expose `id`, `audio`, `context` (time, timezone, location, profile, installed apps/tools), and optional `history` with user audio and prior assistant text/tool calls/results. The current audio path is split-relative.
+
+`ToolEnv(split, id, root)` loads one sample internally. The agent may use `validate`, `call`, `get_tool_calls`, and `get_state_hash`; it must never inspect files under a split environment directory. All `call` attempts, including schema-rejected attempts, appear in `get_tool_calls`. Proposed calls rejected by our prevalidation do not. History actions are already reflected in the initial environment and must not be replayed. Each submission row has exactly `id`, ordered `tool_calls`, and the state hash obtained after those calls. The installed catalog supplies JSON Schemas and extensions including `x-one-of`, `x-ref`, and `x-match`.
+
+The shipped kit has a CLI submission validator but no standalone official score implementation in the visible non-environment files. Thus official score and final-state match cannot be reported yet. The kit is authoritative where its behavior differs from the task prompt, particularly recording schema-rejected `env.call` attempts.
+
+The task prompt reports SLM limits of under 6B total parameters, under 5B LLM parameters, 16,384 tokens, and 30 seconds per sample on one A30, offline inference, and a pre-2026-10-26 release cutoff. These need confirmation from the live Rule tab before contest submission. No checkpoint has been locally audited for exact parameter count or release eligibility yet.
