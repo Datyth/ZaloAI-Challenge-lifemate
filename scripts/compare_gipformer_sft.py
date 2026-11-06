@@ -67,7 +67,13 @@ def summarize_agent(run: Path, ids: list[str]) -> tuple[dict, dict]:
     if config.get("sample_ids") != ids or [r.get("id") for r in predictions] != ids or metrics.get("replay_hash_matches") != 200:
         raise ValueError(f"incomplete 200-row E1/S1 Agent run: {run}")
     good = {r["id"]: r.get("status") == "ok" and r.get("train_state_match") is True for r in predictions}
+    events = rows(run / "tool_events.jsonl")
+    exceptions = rows(run / "runtime_errors.jsonl")
     return {"state_matches": sum(good.values()), "runtime_errors": sum(r.get("status") != "ok" for r in predictions),
+            "runtime_exceptions": len(exceptions),
+            "tool_validation_errors": sum(event.get("validation", {}).get("ok") is False for event in events),
+            "tool_call_f1": statistics.mean(r.get("train_exact_call_f1_surrogate", 0.0)
+                                            if r.get("status") == "ok" else 0.0 for r in predictions),
             "latency_mean_seconds": metrics["latency_mean_seconds"],
             "latency_p95_seconds": metrics["latency_p95_seconds"],
             "adapter_weights_sha256": config.get("adapter_weights_sha256"),
@@ -90,6 +96,7 @@ def compare(base_cache: Path, candidate_cache: Path, base_run: Path, candidate_r
         raise ValueError("Agent adapter or prompt differs between baseline and candidate")
     checks = {"state_match_improved": candidate_agent["state_matches"] > base_agent["state_matches"],
               "runtime_errors_not_worse": candidate_agent["runtime_errors"] <= base_agent["runtime_errors"],
+              "tool_call_f1_not_worse_by_1pt": candidate_agent["tool_call_f1"] >= base_agent["tool_call_f1"] - 0.01,
               "p95_latency_acceptable": candidate_agent["latency_p95_seconds"] <= max(10.0, 1.25 * base_agent["latency_p95_seconds"]),
               "asr_p95_latency_acceptable": candidate_asr["current"]["latency_p95_seconds"] <= max(1.0, 1.5 * base_asr["current"]["latency_p95_seconds"]),
               "wer_not_worse_by_5pct": candidate_asr["current"]["wer"] <= 1.05 * base_asr["current"]["wer"],
@@ -109,11 +116,11 @@ def compare(base_cache: Path, candidate_cache: Path, base_run: Path, candidate_r
             out.write(json.dumps({"id": sid, "baseline": {**base_samples[sid], "state_match": base_correct[sid]},
                                   "candidate": {**candidate_samples[sid], "state_match": candidate_correct[sid]}},
                                  ensure_ascii=False) + "\n")
-    lines = ["# Gipformer LifeMate adaptation", "", "| Configuration | Current WER | Current CER | Slots | History WER | State match | Runtime errors | P95 latency |",
-             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    lines = ["# Gipformer LifeMate adaptation", "", "| Configuration | Current WER | Current CER | Slots | History WER | State match | Tool F1 | Non-OK samples | Validation errors | Agent latency mean/P95 |",
+             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for name in ("baseline", "candidate"):
         a, g = result[name]["asr"], result[name]["agent"]
-        lines.append(f"| {name} | {a['current']['wer']:.1%} | {a['current']['cer']:.1%} | {a['current']['critical_slot_accuracy']:.1%} | {a['history']['wer']:.1%} | {g['state_matches']}/200 | {g['runtime_errors']} | {g['latency_p95_seconds']:.2f}s |")
+        lines.append(f"| {name} | {a['current']['wer']:.1%} | {a['current']['cer']:.1%} | {a['current']['critical_slot_accuracy']:.1%} | {a['history']['wer']:.1%} | {g['state_matches']}/200 | {g['tool_call_f1']:.3f} | {g['runtime_errors']} | {g['tool_validation_errors']} | {g['latency_mean_seconds']:.2f}/{g['latency_p95_seconds']:.2f}s |")
     lines += ["", f"Selected: `{result['selected_asr_dir']}`", "", f"Gates: `{json.dumps(checks)}`", "",
               f"Paired transitions: {transitions['incorrect_to_correct']} incorrect→correct, {transitions['correct_to_incorrect']} correct→incorrect.", ""]
     (output_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")

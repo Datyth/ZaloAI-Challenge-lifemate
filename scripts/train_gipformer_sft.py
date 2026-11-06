@@ -13,6 +13,7 @@ from pathlib import Path
 import random
 import sys
 import time
+import unicodedata
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "scripts"))
@@ -21,6 +22,19 @@ from gipformer_pt import ORIGINAL, sha256, strict_model  # noqa: E402
 
 def read_rows(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.open(encoding="utf-8") if line.strip()]
+
+
+def normalized_target(text: str) -> str:
+    """Match the uppercase, punctuation-free vocabulary of the pretrained BPE.
+
+    Digits require a Vietnamese spoken-form normalizer. Reject those rows rather
+    than teaching the model an incorrect or unknown target for the audio.
+    """
+    text = "".join(" " if unicodedata.category(char)[0] in "PS" else char
+                   for char in text.upper())
+    if any(char.isdigit() for char in text):
+        return ""
+    return " ".join(text.split())
 
 
 def main() -> None:
@@ -58,8 +72,8 @@ def main() -> None:
     frozen = PROJECT / "outputs/splits/validation_ids.json"
     if manifest.get("validation_samples_excluded") != 200 or manifest.get("validation_ids_sha256") != sha256(frozen):
         raise ValueError("SFT data was not prepared against the frozen 200 validation IDs")
-    train = read_rows(args.data_dir / "train.jsonl")[:args.max_train_audio]
-    dev = read_rows(args.data_dir / "dev.jsonl")[:args.max_dev_audio]
+    train = read_rows(args.data_dir / "train.jsonl")
+    dev = read_rows(args.data_dir / "dev.jsonl")
     if not train or not dev or set(x["audio"] for x in train) & set(x["audio"] for x in dev):
         raise ValueError("empty or overlapping internal train/dev audio")
     model, params = strict_model(args.model_dir, args.icefall_root)
@@ -75,6 +89,20 @@ def main() -> None:
         raise AssertionError("no encoder parameters selected for adaptation")
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate, weight_decay=0.01)
     sp = spm.SentencePieceProcessor(model_file=str(args.model_dir / "bpe.model"))
+    def valid_targets(rows: list[dict], limit: int) -> tuple[list[dict], int]:
+        kept = []
+        for row in rows:
+            target = normalized_target(row["text"])
+            ids = sp.encode(target, out_type=int) if target else []
+            if not ids or sp.unk_id() in ids or any(token <= 0 or token >= params.vocab_size for token in ids):
+                continue
+            kept.append({**row, "target_text": target})
+        return kept[:limit], len(rows) - len(kept)
+    train, skipped_train = valid_targets(train, args.max_train_audio)
+    dev, skipped_dev = valid_targets(dev, args.max_dev_audio)
+    if not train or not dev:
+        raise ValueError("no TRAIN audio has a fully supported Gipformer BPE target")
+    print(f"BPE targets: train={len(train)} dev={len(dev)} skipped_train={skipped_train} skipped_dev={skipped_dev}", flush=True)
     opts = kaldifeat.FbankOptions()
     opts.device = torch.device("cuda:0")
     opts.frame_opts.dither = 0
@@ -95,8 +123,8 @@ def main() -> None:
         feature = fbank([samples])[0]
         if feature.shape[0] < 16:
             raise ValueError(f"audio too short for Zipformer: {row['audio']}")
-        tokens = sp.encode(row["text"], out_type=int)
-        if not tokens or any(token < 0 or token >= params.vocab_size for token in tokens):
+        tokens = sp.encode(row["target_text"], out_type=int)
+        if not tokens or any(token <= 0 or token >= params.vocab_size or token == sp.unk_id() for token in tokens):
             raise ValueError(f"invalid BPE sequence: {row['audio']}")
         y = k2.RaggedTensor([tokens])
         simple, pruned, ctc, _, _ = model(feature.unsqueeze(0),
@@ -132,7 +160,9 @@ def main() -> None:
               "data_dir": str(args.data_dir.resolve()), "data_manifest": manifest, "icefall_root": str(args.icefall_root.resolve()),
               "physical_gpu": args.physical_gpu, "learning_rate": args.learning_rate, "epochs": args.epochs,
               "max_train_audio": len(train), "max_dev_audio": len(dev), "eval_every": args.eval_every,
-              "patience": args.patience, "trainable_parameters": sum(p.numel() for p in trainable)}
+              "patience": args.patience, "trainable_parameters": sum(p.numel() for p in trainable),
+              "target_normalization": "uppercase, punctuation/symbols removed; digits and unknown BPE rows skipped",
+              "skipped_train_audio": skipped_train, "skipped_dev_audio": skipped_dev}
     (args.output_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     best = math.inf
     stale = 0

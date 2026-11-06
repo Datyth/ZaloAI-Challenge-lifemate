@@ -51,6 +51,8 @@ def export(best: Path, output_dir: Path, icefall_root: Path, device: str) -> dic
     transcript = recognizer.transcribe(audio_path(PROJECT / "data/train+public_test", "train", sample["audio"]))
     if not transcript:
         raise RuntimeError("exported ONNX model produced an empty smoke transcript")
+    if "<sos/eos>" in transcript or "<unk>" in transcript or "<blk>" in transcript:
+        raise RuntimeError(f"exported ONNX model emitted a special token: {transcript!r}")
     manifest = {"model": "Gipformer 1.5 LifeMate adapted", "source_sha256": saved["source_sha256"],
                 "adapted_checkpoint": str(best.resolve()), "adapted_sha256": sha256(best),
                 "onnx_sha256": {part: sha256(output_dir / f"{part}.onnx") for part in ("encoder", "decoder", "joiner")},

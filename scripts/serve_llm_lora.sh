@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve the original Qwen3-4B checkpoint plus one PEFT adapter on GPU 2.
+# Serve the original Qwen3-4B checkpoint plus one PEFT adapter (GPU 2 by default).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 adapter_dir="${1:-outputs/sft/qwen3_4b_e1_qlora_01/best_adapter}"
@@ -11,7 +11,12 @@ if [ "${CONDA_DEFAULT_ENV:-}" != "datpt_lifemate" ]; then
   echo "Activate datpt_lifemate first" >&2
   exit 2
 fi
-export CUDA_VISIBLE_DEVICES=2
+physical_gpu="${LIFEMATE_PHYSICAL_GPU:-2}"
+if ! [[ "$physical_gpu" =~ ^[0-9]+$ ]]; then
+  echo "Invalid physical GPU index: $physical_gpu" >&2
+  exit 2
+fi
+export CUDA_VISIBLE_DEVICES="$physical_gpu"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 exec vllm serve "$(realpath models/qwen3-4b-instruct-2507)" \
