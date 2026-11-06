@@ -6,7 +6,7 @@ import re
 import time
 from typing import Callable
 
-from .history import ids_in, structured_history, successful
+from .history import ids_in, outcome, structured_history, successful
 
 
 PROMPT = """Bạn là trợ lý LifeMate. Chuyển lời nói mới nhất thành đúng các thao tác trên các ứng dụng đã cài.
@@ -30,9 +30,70 @@ Với yêu cầu có điều kiện, chỉ thực hiện nhánh mà dữ liệu 
 Không thực hiện thao tác ghi chỉ vì đã gọi tool đọc. Với yêu cầu chỉ hỏi thông tin, kết thúc sau khi đọc đủ.
 """
 
+GENERAL_PROMPT = """Bạn là trợ lý LifeMate. Thực hiện yêu cầu hiện tại bằng các tool được cung cấp.
+Lịch sử là dữ liệu chỉ đọc: thao tác đã hoàn tất trong lịch sử không phải yêu cầu mới.
+Trước khi ghi, dùng kết quả tool đọc hoặc ID do người dùng cung cấp để xác định đúng đối tượng.
+Theo dõi từng hành động được yêu cầu. Chỉ xem hành động hoàn tất khi kết quả tool xác nhận thành công;
+ok=true, done=false không xác nhận hoàn tất. Với hành động phụ thuộc, chờ kết quả bước trước.
+Nếu thiếu tham số bắt buộc sau khi tra cứu hợp lệ, dùng sys.ask_missing_info. Không bịa ID hoặc tham số.
+Không lặp lại thao tác ghi đã thành công hoặc chưa rõ kết quả. Nếu chỉ hỏi thông tin, dừng sau khi đọc đủ.
+Chỉ gọi native tool_calls; lời mô tả không thực thi tool. Dừng khi yêu cầu đã hoàn tất.
+"""
+
 
 def prompt_for(orchestration: str) -> str:
+    if orchestration == "O5":
+        return GENERAL_PROMPT
     return E6_PROMPT if orchestration == "E6" else PROMPT
+
+
+def _ids_for_reference(result: object, reference: str) -> set[str]:
+    """Use only a named collection in an observation, not unrelated IDs in the same app."""
+    collection = reference.split(".", 1)[-1]
+    singular = collection[:-1] if collection.endswith("s") else collection
+    found: set[str] = set()
+    if isinstance(result, dict):
+        for key, value in result.items():
+            if key in {collection, singular}:
+                found.update(ids_in(value))
+            elif isinstance(value, (dict, list)):
+                found.update(_ids_for_reference(value, reference))
+    elif isinstance(result, list):
+        for value in result:
+            found.update(_ids_for_reference(value, reference))
+    return found
+
+
+def _observation_for_model(result: object, limit: int = 16000) -> str:
+    serialized = json.dumps(result, ensure_ascii=False)
+    if len(serialized) <= limit:
+        return serialized
+    if not isinstance(result, dict):
+        return json.dumps({"truncated": True, "type": type(result).__name__}, ensure_ascii=False)
+    compact: dict = {key: (value[:1000] if isinstance(value, str) and len(value) > 1000 else value)
+                     for key, value in result.items() if key in {"ok", "done", "error", "message", "waiting_for_user", "id"}}
+    compact["truncated"] = True
+    for key, value in result.items():
+        if key in compact:
+            continue
+        if isinstance(value, list):
+            compact[key] = []
+            for entry in value:
+                trial = {**compact, key: [*compact[key], entry]}
+                if len(json.dumps(trial, ensure_ascii=False)) > limit:
+                    break
+                compact[key].append(entry)
+            compact[f"{key}_total"] = len(value)
+            compact[f"{key}_shown"] = len(compact[key])
+        elif len(json.dumps({**compact, key: value}, ensure_ascii=False)) <= limit:
+            compact[key] = value
+    while len(json.dumps(compact, ensure_ascii=False)) > limit:
+        largest = max((key for key, value in compact.items() if isinstance(value, list) and value), key=lambda key: len(compact[key]), default=None)
+        if largest is None:
+            break
+        compact[largest].pop()
+        compact[f"{largest}_shown"] = len(compact[largest])
+    return json.dumps(compact, ensure_ascii=False)
 
 
 def _explicit_write_request(transcript: str) -> bool:
@@ -43,6 +104,11 @@ def _explicit_write_request(transcript: str) -> bool:
         r"dời|đổi\s+lịch|đặt\s+(?:lịch|báo\s+thức)|tạo|xóa|xoá|hủy|huỷ|bật|tắt|thêm)\b",
         transcript.strip(), re.I,
     ))
+
+
+def _multiple_actions_requested(transcript: str) -> bool:
+    verbs = re.findall(r"\b(?:chuyển\s+tiền|trả\s+tiền|thanh\s+toán|nhắn|gửi\s+(?:tin|sms)|dời|đổi\s+lịch|đặt\s+(?:lịch|báo\s+thức)|tạo|xóa|xoá|hủy|huỷ|bật|tắt|thêm)\b", transcript, re.I)
+    return len(verbs) >= 2
 
 
 def _tool_defs(specs: list[dict]) -> list[dict]:
@@ -97,8 +163,9 @@ def _alarm_time_unverified(transcript: str, observed_clock: bool) -> bool:
 
 
 def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe_history: Callable[[str], str], log: Callable[[str, dict], None], max_turns: int = 6, deadline_seconds: float = 30, orchestration: str = "E1") -> dict:
-    if orchestration not in {"E0", "E1", "E2", "E3", "E6"}:
+    if orchestration not in {"E0", "E1", "E2", "E3", "E6", "O1", "O2", "O3", "O4", "O5"}:
         raise ValueError(f"unknown orchestration: {orchestration}")
+    stage = int(orchestration[1]) if orchestration.startswith("O") else 0
     start = time.monotonic()
     messages = [{"role": "system", "content": prompt_for(orchestration)}]
     if orchestration == "E0":
@@ -131,13 +198,42 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
     failed_write = False
     observed_clock = False
     attempted_writes: set[str] = set()
+    ledger: list[dict] = []
+    observed_refs: dict[str, set[str]] = {}
+    if stage >= 4:
+        for turn in item.get("history", []):
+            if turn.get("role") == "assistant":
+                for old_call, old_result in zip(turn.get("tool_calls") or [], turn.get("tool_results") or []):
+                    name = old_call.get("name", "") if isinstance(old_call, dict) else ""
+                    if successful(old_result):
+                        for reference in {p["x-ref"] for spec in specs for p in (spec.get("parameters") or {}).get("properties", {}).values() if isinstance(p, dict) and "x-ref" in p}:
+                            if name.startswith(reference.split(".", 1)[0] + "."):
+                                observed_refs.setdefault(reference, set()).update(_ids_for_reference(old_result, reference))
     historical_writes = {
         json.dumps([action["tool"], action["arguments"]], ensure_ascii=False, sort_keys=True)
         for action in structured.get("historical_actions", [])
         if action.get("kind") == "write" and action.get("verified") and "tool" in action
     }
     explicit_repeat = bool(re.search(r"\b(?:lại|nữa|again|repeat)\b", transcript, re.I))
+    def record_tool_event(record: dict) -> None:
+        log("tool_events", record)
+        if stage >= 2:
+            proposed = record.get("proposed")
+            function = proposed.get("function", {}) if isinstance(proposed, dict) else {}
+            emitted = function.get("name", "") if isinstance(function, dict) else ""
+            name = record.get("name") or aliases.get(emitted, emitted)
+            entry = {"sample_id": item["id"], "turn": record["turn"], "call_id": proposed.get("id") if isinstance(proposed, dict) else None,
+                     "name": name, "kind": specs_by_name.get(name, {}).get("kind", "unknown"),
+                     "validation": record.get("validation"), "executed": record.get("executed", False),
+                     "arguments": record.get("arguments"), "outcome": record.get("outcome", "validation_error" if not record.get("executed") else "unknown")}
+            ledger.append(entry)
+            log("execution_ledger", entry)
     def finish(status: str) -> dict:
+        if stage >= 2:
+            completed = any(entry["kind"] == "write" and entry["outcome"] == "completed" for entry in ledger)
+            unsuccessful = any(entry["kind"] == "write" and entry["outcome"] in {"unsuccessful", "rejected"} for entry in ledger)
+            if completed and unsuccessful:
+                status = "partial_write"
         log("terminations", {"sample_id": item["id"], "status": status, "turns": index + 1, "elapsed_seconds": time.monotonic() - start,
                              "invalid_proposals": invalid_proposals})
         return {"id": item["id"], "tool_calls": env.get_tool_calls(), "state_hash": env.get_state_hash()}
@@ -175,20 +271,31 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
         if time.monotonic() - start >= deadline_seconds:
             log("terminations", {"sample_id": item["id"], "status": "timeout", "turns": index + 1})
             raise TimeoutError("LLM response exceeded per-sample deadline")
-        messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": calls} if calls else {"role": "assistant", "content": message.get("content") or ""})
-        if orchestration in {"E2", "E3"} and reason == "length":
+        if (orchestration in {"E2", "E3"} or stage >= 1) and reason == "length":
             log("terminations", {"sample_id": item["id"], "status": "token_limit", "turns": index + 1})
             raise RuntimeError("LLM output reached token limit")
-        if orchestration in {"E2", "E3"} and (reason not in {"stop", "tool_calls"} or (reason == "tool_calls" and not calls and not fake)):
+        if (orchestration in {"E2", "E3"} or stage >= 1) and (reason not in {"stop", "tool_calls"} or (reason == "tool_calls" and not calls and (stage >= 1 or not fake)) or (stage >= 1 and calls and reason != "tool_calls")):
             log("terminations", {"sample_id": item["id"], "status": "invalid_response", "turns": index + 1, "finish_reason": reason})
             raise RuntimeError("invalid LLM finish reason or missing native calls")
+        protocol_calls = calls
+        if stage >= 1 and calls:
+            ids = [call.get("id") if isinstance(call, dict) else None for call in calls]
+            if any(not isinstance(call_id, str) or not call_id for call_id in ids) or len(set(ids)) != len(ids):
+                log("terminations", {"sample_id": item["id"], "status": "invalid_response", "turns": index + 1, "error": "missing or duplicate tool_call_id"})
+                raise RuntimeError("malformed native function call ID")
+            protocol_calls = [call if call.get("type") == "function" and isinstance(call.get("function"), dict)
+                              and isinstance(call["function"].get("name"), str) and call["function"]["name"] and isinstance(call["function"].get("arguments"), str)
+                              else {"id": call["id"], "type": "function", "function": {"name": "invalid_call", "arguments": "{}"}}
+                              for call in calls]
+        messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": protocol_calls} if calls else {"role": "assistant", "content": message.get("content") or ""})
         if not calls:
-            if (orchestration == "E6" and not recovered_incomplete_read and not completed_write and not missing_info
-                and not failed_write and index + 2 < max_turns and time.monotonic() - start < deadline_seconds - 2
+            if ((orchestration == "E6" or stage >= 3) and not recovered_incomplete_read and (stage >= 3 or not completed_write) and not missing_info
+                and (stage >= 3 or not failed_write) and index + 2 < max_turns and time.monotonic() - start < deadline_seconds - 2
                 and _explicit_write_request(transcript)
-                and any(specs_by_name.get(c["name"], {}).get("kind") == "read" for c in env.get_tool_calls())):
+                and (any(specs_by_name.get(c["name"], {}).get("kind") == "read" for c in env.get_tool_calls())
+                     or (stage >= 3 and _multiple_actions_requested(transcript) and completed_write))):
                 recovered_incomplete_read = True
-                log("protocol_events", {"sample_id": item["id"], "turn": index, "kind": "read_to_action_check"})
+                log("protocol_events", {"sample_id": item["id"], "turn": index, "kind": "completion_check" if stage >= 3 else "read_to_action_check", "successful_writes": sum(1 for event in ledger if event["kind"] == "write" and event["outcome"] == "completed") if stage >= 2 else int(completed_write)})
                 messages.append({"role": "user", "content": "Kiểm tra lại yêu cầu hiện tại và các tool đã thực sự thành công. Nếu còn hành động được yêu cầu mà chưa hoàn tất, hãy gọi native tool phù hợp. Nếu chỉ cần đọc, điều kiện không đúng, hoặc không có thao tác an toàn tiếp theo, hãy kết thúc; đừng bịa tham số hay ID."})
                 continue
             if orchestration in {"E2", "E3"} and fake:
@@ -206,7 +313,11 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
         for call in calls:
             if not isinstance(call, dict) or call.get("type") != "function" or not isinstance(call.get("function"), dict) or not isinstance(call.get("id"), str) or not call["id"]:
                 invalid_proposals += 1
-                log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, "executed": False, "error": "not a native function call"})
+                validation = {"ok": False, "error": "not a native function call"}
+                record_tool_event({"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False, "error": validation["error"]})
+                if stage >= 1:
+                    messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(validation)})
+                    continue
                 if orchestration in {"E2", "E3"}:
                     log("terminations", {"sample_id": item["id"], "status": "invalid_response", "turns": index + 1})
                     raise RuntimeError("malformed native function call")
@@ -215,18 +326,20 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
             if not isinstance(emitted_name, str) or not emitted_name:
                 invalid_proposals += 1
                 validation = {"ok": False, "error": "missing function name"}
-                log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
+                record_tool_event({"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(validation)})
                 continue
             name = aliases.get(emitted_name, emitted_name)
             raw = call.get("function", {}).get("arguments", "")
             try:
+                if stage >= 1 and not isinstance(raw, str):
+                    raise ValueError("arguments must be a JSON string")
                 args = json.loads(raw) if isinstance(raw, str) else raw
                 if not isinstance(args, dict):
                     raise ValueError("arguments must be an object")
             except (ValueError, TypeError) as exc:
                 invalid_proposals += 1
-                log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, "executed": False, "error": str(exc)})
+                record_tool_event({"sample_id": item["id"], "turn": index, "proposed": call, "executed": False, "error": str(exc)})
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps({"error": str(exc)})})
                 continue
             if name == "sys.ask_missing_info" and isinstance(args.get("tool_name"), str):
@@ -235,7 +348,7 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
             if orchestration == "E3" and name not in specs_by_name:
                 invalid_proposals += 1
                 validation = {"ok": False, "error": f"unavailable tool: {name}"}
-                log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
+                record_tool_event({"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(validation)})
                 continue
             if spec.get("kind") == "read":
@@ -249,53 +362,58 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
             if validation["ok"]:
                 for key, prop in (spec.get("parameters") or {}).get("properties", {}).items():
                     reference = prop.get("x-ref")
-                    allowed = observed_ids.get(reference.split(".", 1)[0], set()) if reference else set()
+                    allowed = (observed_refs.get(reference, set()) if stage >= 4 else observed_ids.get(reference.split(".", 1)[0], set())) if reference else set()
                     if reference and key in args and (not isinstance(args[key], str) or
-                        (args[key] not in allowed and not (orchestration == "E3" and _user_supplied_id(args[key], transcript, structured["previous_requests"])))):
+                        (args[key] not in allowed and not ((orchestration == "E3" or stage >= 4) and _user_supplied_id(args[key], transcript, structured["previous_requests"])))):
                         validation = {"ok": False, "error": f"{key} must come from an observed {reference} ID; call a read tool first"}
                         break
             if not validation["ok"]:
                 invalid_proposals += 1
-                log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
+                record_tool_event({"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(validation, ensure_ascii=False)})
                 continue
             if orchestration in {"E2", "E3"} and name == "alarm.create" and _alarm_time_unverified(transcript, observed_clock):
                 invalid_proposals += 1
                 validation = {"ok": False, "error": "alarm time is not grounded in the current request or a read observation"}
-                log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
+                record_tool_event({"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
                 guidance = {**validation, "next_step": "Call sys.ask_missing_info for alarm.create with params ['time']; do not invent an hour."}
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(guidance)})
                 continue
             if orchestration == "E3" and _contradicts_device_request(name, args, transcript):
                 invalid_proposals += 1
                 validation = {"ok": False, "error": "device-on call contradicts an explicit negative request"}
-                log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
+                record_tool_event({"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
                 guidance = {**validation, "next_step": "Do not retry this action. Continue any other independent actions explicitly requested by the user."}
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(guidance)})
                 continue
-            if orchestration == "E3" and spec.get("kind") == "write":
+            if (orchestration == "E3" or stage >= 2) and spec.get("kind") == "write":
                 signature = json.dumps([name, args], ensure_ascii=False, sort_keys=True)
                 if signature in attempted_writes or (signature in historical_writes and not explicit_repeat):
                     invalid_proposals += 1
                     validation = {"ok": False, "error": "duplicate side-effecting call blocked" if signature in attempted_writes else "historical completed action blocked"}
-                    log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
+                    record_tool_event({"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": False})
                     messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(validation)})
                     continue
                 attempted_writes.add(signature)
             t0 = time.monotonic()
             result = env.call(name, args)
+            result_outcome = outcome(result, spec.get("kind", "unknown"))
             if successful(result):
                 observed_ids.setdefault(name.split(".", 1)[0], set()).update(ids_in(result))
+                if stage >= 4 and spec.get("kind") == "read":
+                    for reference in {p["x-ref"] for tool_spec in specs for p in (tool_spec.get("parameters") or {}).get("properties", {}).values() if isinstance(p, dict) and "x-ref" in p}:
+                        if name.startswith(reference.split(".", 1)[0] + "."):
+                            observed_refs.setdefault(reference, set()).update(_ids_for_reference(result, reference))
                 if spec.get("kind") == "read" and re.search(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", json.dumps(result)):
                     observed_clock = True
             if name == "sys.ask_missing_info" and successful(result):
                 missing_info = True
-            if spec.get("kind") == "write" and successful(result):
+            if spec.get("kind") == "write" and result_outcome == "completed":
                 completed_write = True
-            if spec.get("kind") == "write" and not successful(result):
+            if spec.get("kind") == "write" and result_outcome != "completed":
                 failed_write = True
-            log("tool_events", {"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": True, "name": name, "arguments": args, "result": result, "latency_seconds": time.monotonic() - t0})
-            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(result, ensure_ascii=False)[:16000]})
+            record_tool_event({"sample_id": item["id"], "turn": index, "proposed": call, "validation": validation, "executed": True, "name": name, "arguments": args, "result": result, "outcome": result_outcome, "latency_seconds": time.monotonic() - t0})
+            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": _observation_for_model(result) if stage >= 1 else json.dumps(result, ensure_ascii=False)[:16000]})
             if orchestration == "E3" and spec.get("kind") == "write" and not successful(result):
                 messages.append({"role": "system", "content": "The previous write did not complete. Do not retry that side effect; report the failure or use a safe read tool."})
     log("terminations", {"sample_id": item["id"], "status": "step_limit", "turns": max_turns})

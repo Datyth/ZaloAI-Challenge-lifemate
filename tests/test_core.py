@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lifemate.agent import execute, prompt_for
-from lifemate.history import structured_history
+from lifemate.agent import execute, prompt_for, _observation_for_model
+from lifemate.history import outcome, structured_history
 from lifemate.data import audio_path, catalog, installed_tools, items
 from lifemate.toolenv import new_env
 from lifemate.submission import validate_file
@@ -61,6 +61,87 @@ class MemoryEnv:
 
 
 class CoreTest(unittest.TestCase):
+    def test_toolenv_outcomes(self):
+        self.assertEqual(outcome({"ok": True, "done": False}, "write"), "unsuccessful")
+        self.assertEqual(outcome({"ok": True, "events": []}, "read"), "observed")
+        self.assertEqual(outcome({"ok": True, "waiting_for_user": True}, "meta"), "waiting_for_user")
+        self.assertEqual(outcome({"ok": True, "id": "a"}, "write"), "completed")
+
+    def test_o1_rejects_length_without_executing_calls(self):
+        item = {"id": "x", "history": [], "context": {"installed_apps": {}}}
+        env = MemoryEnv(); events = []
+        model = ResponsesLLM([response(call=("alarm__delete", {}), reason="length")])
+        with self.assertRaisesRegex(RuntimeError, "token limit"):
+            execute(item, "x", [], env, model, lambda _: "", lambda kind, x: events.append((kind, x)), orchestration="O1")
+        self.assertEqual(env.calls, [])
+        self.assertEqual([x["status"] for kind, x in events if kind == "terminations"], ["token_limit"])
+
+    def test_o1_malformed_call_gets_matching_response(self):
+        item = {"id": "x", "history": [], "context": {"installed_apps": {}}}
+        malformed = {"id": "bad_1", "type": "other", "function": {"name": "foo", "arguments": "{}"}}
+        model = ResponsesLLM([{"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [malformed]}, "finish_reason": "tool_calls"}]}, response()])
+        events = []
+        execute(item, "x", [], MemoryEnv(), model, lambda _: "", lambda kind, x: events.append((kind, x)), orchestration="O1")
+        previous = model.messages[1]
+        self.assertEqual(previous[-2]["tool_calls"][0]["id"], "bad_1")
+        self.assertEqual(previous[-2]["tool_calls"][0]["type"], "function")
+        self.assertEqual(previous[-1]["tool_call_id"], "bad_1")
+
+    def test_o2_does_not_repeat_unsuccessful_write(self):
+        class NoopEnv(MemoryEnv):
+            def call(self, name, args):
+                super().call(name, args)
+                return {"ok": True, "done": False, "message": "not found"}
+        item = {"id": "x", "history": [], "context": {"installed_apps": {}}}
+        specs = [{"name": "alarm.delete", "kind": "write", "parameters": {"type": "object", "properties": {}}}]
+        model = ResponsesLLM([response(call=("alarm__delete", {})), response(call=("alarm__delete", {})), response()])
+        env = NoopEnv(); events = []
+        execute(item, "x", specs, env, model, lambda _: "", lambda kind, x: events.append((kind, x)), orchestration="O2")
+        self.assertEqual(len(env.calls), 1)
+        self.assertEqual([x["outcome"] for kind, x in events if kind == "execution_ledger"], ["unsuccessful", "validation_error"])
+
+    def test_o4_grounds_collection_not_sibling_collection(self):
+        item = {"id": "x", "history": [], "context": {"installed_apps": {}}}
+        specs = [{"name": "banking.get_accounts", "kind": "read", "parameters": {"type": "object", "properties": {}}},
+                 {"name": "banking.transfer", "kind": "write", "parameters": {"type": "object", "properties": {"beneficiary_id": {"type": "string", "x-ref": "banking.beneficiaries"}}, "required": ["beneficiary_id"]}}]
+        class AccountsEnv(MemoryEnv):
+            def call(self, name, args):
+                super().call(name, args)
+                return {"ok": True, "accounts": [{"id": "shared_1"}]} if name == "banking.get_accounts" else {"ok": True}
+        model = ResponsesLLM([response(call=("banking__get_accounts", {})), response(call=("banking__transfer", {"beneficiary_id": "shared_1"})), response()])
+        env = AccountsEnv(); events = []
+        execute(item, "x", specs, env, model, lambda _: "", lambda kind, x: events.append((kind, x)), orchestration="O4")
+        self.assertEqual([x["name"] for x in env.calls], ["banking.get_accounts"])
+        self.assertTrue(any(kind == "tool_events" and x.get("validation", {}).get("ok") is False for kind, x in events))
+
+    def test_o3_checks_after_first_of_two_writes(self):
+        item = {"id": "x", "history": [], "context": {"installed_apps": {}}}
+        specs = [{"name": "alarm.create", "kind": "write", "parameters": {"type": "object", "properties": {}}},
+                 {"name": "reminders.create", "kind": "write", "parameters": {"type": "object", "properties": {}}}]
+        model = ResponsesLLM([response(call=("alarm__create", {})), response("đã đặt báo thức"),
+                              response(call=("reminders__create", {})), response()])
+        env = MemoryEnv(); events = []
+        execute(item, "Đặt báo thức và tạo nhắc nhở", specs, env, model, lambda _: "", lambda kind, x: events.append((kind, x)), orchestration="O3")
+        self.assertEqual([x["name"] for x in env.calls], ["alarm.create", "reminders.create"])
+        self.assertEqual(sum(kind == "protocol_events" and x.get("kind") == "completion_check" for kind, x in events), 1)
+
+    def test_o4_accepts_explicit_user_id(self):
+        item = {"id": "x", "history": [], "context": {"installed_apps": {}}}
+        specs = [{"name": "alarm.delete", "kind": "write", "parameters": {"type": "object", "properties": {"alarm_id": {"type": "string", "x-ref": "alarm.alarms"}}, "required": ["alarm_id"]}}]
+        env = MemoryEnv()
+        execute(item, "Xóa alm_01", specs, env, ResponsesLLM([response(call=("alarm__delete", {"alarm_id": "alm_01"})), response()]), lambda _: "", lambda *_: None, orchestration="O4")
+        self.assertEqual(len(env.calls), 1)
+
+    def test_o5_prompt_is_general(self):
+        self.assertNotIn("calendar.list_events", prompt_for("O5"))
+        self.assertIn("done=false", prompt_for("O5"))
+
+    def test_large_observation_remains_json_with_status(self):
+        text = _observation_for_model({"ok": True, "done": False, "message": "not found", "events": [{"id": str(i), "title": "x" * 1000} for i in range(100)]})
+        self.assertLessEqual(len(text), 16000)
+        self.assertEqual(json.loads(text)["done"], False)
+        self.assertTrue(json.loads(text)["truncated"])
+
     def test_structured_history_verification_and_order(self):
         history = [{"role": "user", "text": "xóa c_1"}, {"role": "assistant", "text": "done", "tool_calls": [{"name": "contacts.get", "arguments": {"contact_id": "c_1"}}], "tool_results": [{"ok": True, "contact": {"id": "c_1"}}]}, {"role": "user", "text": "xóa c_2"}, {"role": "assistant", "text": "done", "tool_calls": [{"name": "contacts.get", "arguments": {"contact_id": "c_2"}}], "tool_results": [{"ok": True, "done": False}]}]
         context, ids = structured_history(history, lambda _: "")

@@ -21,6 +21,19 @@ def successful(result: object) -> bool:
     return isinstance(result, dict) and result.get("ok") is True and result.get("done") is not False
 
 
+def outcome(result: object, kind: str = "unknown") -> str:
+    """Classify ToolEnv's accepted no-op separately from a completed operation."""
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return "rejected"
+    if result.get("done") is False:
+        return "unsuccessful"
+    if kind == "read":
+        return "observed"
+    if kind == "meta" and result.get("waiting_for_user") is True:
+        return "waiting_for_user"
+    return "completed" if kind == "write" else "accepted"
+
+
 def structured_history(history: list[dict], transcribe: Callable[[str], str], tool_kinds: dict[str, str] | None = None) -> tuple[dict, dict[str, set[str]]]:
     requests: list[dict] = []
     actions: list[dict] = []

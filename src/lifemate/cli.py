@@ -98,8 +98,18 @@ def run(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"ASR checkpoint missing: {args.asr_dir}")
     saved_transcripts: dict[tuple[str, str], dict] = {}
     if args.transcript_source == "cached-asr":
-        if split != "train" or args.command != "evaluate" or args.transcripts_jsonl is None:
-            raise ValueError("cached-asr requires TRAIN evaluate and --transcripts-jsonl")
+        if args.command not in {"evaluate", "submit", "smoke"} or args.transcripts_jsonl is None:
+            raise ValueError("cached-asr requires --transcripts-jsonl")
+        cache_config_path = args.transcripts_jsonl.parent / "run_config.json"
+        cache_metrics_path = args.transcripts_jsonl.parent / "metrics.json"
+        if cache_config_path.is_file():
+            cache_config = json.loads(cache_config_path.read_text(encoding="utf-8"))
+            if cache_config.get("split") != split or cache_config.get("model") != str(args.asr_dir):
+                raise ValueError("ASR cache split or checkpoint differs from this run")
+        if cache_metrics_path.is_file():
+            cache_metrics = json.loads(cache_metrics_path.read_text(encoding="utf-8"))
+            if cache_metrics.get("complete") is False:
+                raise ValueError("ASR cache is incomplete")
         expected_model = str(args.asr_dir)
         with args.transcripts_jsonl.open(encoding="utf-8") as source:
             for line in source:
@@ -148,6 +158,8 @@ def run(args: argparse.Namespace) -> None:
     (run_dir / "runtime_errors.jsonl").touch()
     specs = catalog(root, split)
     destination = args.output if args.output else run_dir / "submission.jsonl"
+    if args.command == "submit" and destination.exists():
+        raise FileExistsError(f"Refusing to overwrite existing submission: {destination}")
     temp = destination.with_name(destination.name + f".{run_id}.partial")
     word_errors = reference_words = character_errors = reference_characters = 0
     durations: list[float] = []
@@ -219,7 +231,12 @@ def run(args: argparse.Namespace) -> None:
                     train_state_matches.append(state_match)
                     train_call_f1.append(call_f1)
                     evaluation = {"train_state_match": state_match, "train_exact_call_f1_surrogate": call_f1}
-                log("predictions", {**result, **evaluation, "status": "ok", "termination": termination.get("status"), "latency_seconds": elapsed, "cached_asr_latency_seconds": cached_asr_seconds})
+                ended = termination.get("status")
+                tool_outcome = "failed" if ended == "tool_error" else "mixed" if ended == "partial_write" else "completed" if ended == "completed_write" else "unverified"
+                log("predictions", {**result, **evaluation, "status": ended if ended in {"tool_error", "partial_write"} else "ok",
+                                    "runtime_status": "completed", "tool_outcome": tool_outcome,
+                                    "task_completion": "matched_gold_state" if evaluation.get("train_state_match") is True else "different_from_gold_state" if evaluation.get("train_state_match") is False else "unknown",
+                                    "termination": ended, "latency_seconds": elapsed, "cached_asr_latency_seconds": cached_asr_seconds})
                 write_jsonl(temp, result)
             except Exception as exc:
                 failures += 1
@@ -229,14 +246,14 @@ def run(args: argparse.Namespace) -> None:
                 if split == "train":
                     train_state_matches.append(False)
                     train_call_f1.append(0.0)
-                log("predictions", {**failed_row, "status": "error", "termination": termination.get("status"), "error": f"{type(exc).__name__}: {exc}", "latency_seconds": elapsed, "cached_asr_latency_seconds": cached_asr_seconds, "train_state_match": False if split == "train" else None, "train_exact_call_f1_surrogate": 0.0 if split == "train" else None})
+                log("predictions", {**failed_row, "status": "error", "runtime_status": "error", "tool_outcome": "unknown", "task_completion": "unknown", "termination": termination.get("status"), "error": f"{type(exc).__name__}: {exc}", "latency_seconds": elapsed, "cached_asr_latency_seconds": cached_asr_seconds, "train_state_match": False if split == "train" else None, "train_exact_call_f1_surrogate": 0.0 if split == "train" else None})
                 log("runtime_errors", {"sample_id": item["id"], "error": f"{type(exc).__name__}: {exc}", "termination": termination.get("status"), "latency_seconds": elapsed})
-                if len(durations) == 1 and args.command == "submit":
+                if len(durations) == 1 and args.command == "submit" and not args.allow_failures:
                     raise RuntimeError(f"first sample failed; refusing to write a full submission: {exc}") from exc
                 write_jsonl(temp, failed_row)
             if item_index % 25 == 0 or item_index == len(selected):
                 print(f"processed {item_index}/{len(selected)} samples; failures={failures}; diagnostic file={temp}", file=sys.stderr, flush=True)
-        if failures and not (args.command == "evaluate" and args.allow_failures):
+        if failures and not args.allow_failures:
             raise RuntimeError(f"{failures} sample(s) failed; refusing to publish a final submission. Inspect {run_dir / 'predictions.jsonl'} and {temp}")
         rows = [json.loads(line) for line in temp.open(encoding="utf-8")]
         expected = [item["id"] for item in selected]
@@ -434,9 +451,9 @@ def main() -> None:
         p.add_argument("--transcript-source", choices=["asr", "cached-asr", "train-reference"], default="asr")
         p.add_argument("--transcripts-jsonl", type=Path)
         p.add_argument("--asr-backend", choices=["qwen", "chunkformer", "gipformer"], default="qwen")
-        p.add_argument("--allow-failures", action="store_true", help="keep complete TRAIN diagnostic output when individual evaluations fail")
+        p.add_argument("--allow-failures", action="store_true", help="keep replay-valid rows and error logs for individual failures")
         p.add_argument("--parser", default="hermes")
-        p.add_argument("--orchestration", choices=["E0", "E1", "E2", "E3", "E6"], default="E1")
+        p.add_argument("--orchestration", choices=["E0", "E1", "E2", "E3", "E6", "O1", "O2", "O3", "O4", "O5"], default="E1")
     trace = sub.add_parser("trace")
     trace.add_argument("--sample-id", required=True)
     trace.add_argument("--run-dir", type=Path, required=True)
