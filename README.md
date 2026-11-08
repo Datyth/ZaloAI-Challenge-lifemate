@@ -4,6 +4,31 @@ This repository contains the organizer's v3.2.0 TRAIN/PUBLIC_TEST kit and a loca
 
 The E1 QLoRA SFT dataset, training, LoRA evaluation, and paired comparison commands are in [the Agent SFT report](docs/agent_sft_report.md). Full training and validation runs are left for manual execution.
 
+## Best pipeline so far: public 58.02 (2026-11-08)
+
+Gipformer ASR v2 (fine-tuned on TRAIN audio, lowercased output) -> Qwen3.5-4B + LoRA `q35_e1` served by vLLM -> E1 agent loop on the organizer's ToolEnv. Validation (200 TRAIN ids): 70.91 with ASR, 82.33 with gold transcripts. Details are in [the 2026-11-08 error analysis](docs/error_analysis_2026-11-08.md); the figure is `docs/figures/pipeline.png`.
+
+The two fine-tuned checkpoints are in the private Hugging Face repo `hugebenevolence/lifemate-q35e1`; ask for access, then log in with `hf auth login`.
+
+```bash
+bash downloads/get_models.sh        # base models, including Qwen/Qwen3.5-4B at a pinned revision
+bash downloads/get_checkpoint.sh    # LoRA -> outputs/sft/q35_e1_01/adapter, ASR v2 -> models/gipformer-lm-v2-01
+bash scripts/serve_qwen35.sh q35_e1=$(realpath outputs/sft/q35_e1_01/adapter)
+```
+
+In a second terminal, run the agent with the settings of the 58.02 run:
+
+```bash
+export LIFEMATE_MERGE_SYSTEM=1
+export LIFEMATE_LLM_EXTRA='{"chat_template_kwargs": {"enable_thinking": false}}'
+DEADLINE=900 SPLIT=public_test ASR_DIR=models/gipformer-lm-v2-01 CACHE=outputs/asr/gipformer-lm-v2-01_public/asr_outputs.jsonl \
+  ADAPTER=outputs/sft/q35_e1_01/adapter SERVED=q35_e1 EXTRA="--asr-lowercase --dedup-calls --llm-dir models/qwen3.5-4b --max-turns 10" \
+  bash analysis/run_shards.sh pub_q35e1 outputs/splits/public_ids.json 4 asr sft E1
+.venv/bin/python analysis/merge_submission.py pub_q35e1 --split public_test --output result/submission.jsonl
+```
+
+`run_shards.sh` reads ASR transcripts from the `CACHE` file (ASR v2, CPU, modified beam search, beam 4) instead of decoding audio itself. Without that cache, `PYTHONPATH=src python -m lifemate.docker_predict --data <split dir> --out <dir> --model q35_e1` runs the same pipeline with ASR inline (12/12 public rows identical to the cached run).
+
 ## Compare Vietnamese ASR models on TRAIN
 
 The ASR benchmark compares the preserved Qwen3-ASR-0.6B run with local ChunkFormer-RNNT-Large-Vie and Gipformer 1.5 checkpoints on the same frozen 200 TRAIN IDs. The two new adapters use the existing `benchmark-asr` interface. Run the full comparison on physical GPU 2 with:
