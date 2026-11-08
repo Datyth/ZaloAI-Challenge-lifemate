@@ -1,0 +1,19 @@
+{
+ "_doc": "Hand labels (2026-11-08) of every val200 sample that q35_e1 gets wrong: 'agent' = wrong with the gold transcript, 'asr' = right with gold text, wrong with ASR v2.",
+ "agent": {
+  "condition / arithmetic over tool results": ["train_0064","train_0203","train_0214","train_0320","train_0346","train_0361","train_1367","train_1651","train_0959","train_1055","train_1226"],
+  "date and time reasoning": ["train_0787","train_0810","train_0819","train_1353"],
+  "optional-argument convention": ["train_0896","train_1356","train_1522","train_1336","train_0864","train_0935","train_1081","train_1340","train_1164","train_1578"],
+  "similar-tool choice (transfer / top-up / QR)": ["train_0041","train_1265","train_1284"],
+  "entity resolution (contact, ID)": ["train_0225","train_1343","train_1044","train_1068","train_1209"],
+  "read-call convention (extra or missing read, read query)": ["train_0469","train_0684","train_0772","train_1279","train_1585","train_1618","train_1249","train_0960","train_1155"],
+  "ask vs act": ["train_1658","train_1685","train_1738","train_1725"],
+  "free-text field": ["train_0779","train_1128"]
+ },
+ "asr": {
+  "proper or foreign name": ["train_1071","train_1327","train_1379","train_1474","train_1481","train_1515","train_1560","train_1686","train_1733","train_1728","train_1687","train_0236"],
+  "number or digits": ["train_0029","train_0279","train_0164","train_0676","train_0747"],
+  "intent or content word": ["train_0015","train_0070","train_0080","train_0282","train_0501","train_1084","train_1219","train_1396","train_1575","train_1021"],
+  "no real word error (case, punctuation, flip)": ["train_0216","train_0313","train_0974"]
+ }
+}
