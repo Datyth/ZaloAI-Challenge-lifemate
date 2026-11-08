@@ -337,3 +337,28 @@ class CoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GroundArgsTest(unittest.TestCase):
+    ORDER = {"name": "food_delivery.place_order", "kind": "write", "parameters": {"type": "object", "required": ["restaurant_id", "items"], "properties": {
+        "restaurant_id": {"type": "string"}, "items": {"type": "array", "items": {"type": "object", "properties": {"item_id": {"type": "string"}, "quantity": {"type": "integer"}}}},
+        "address": {"type": "string"}}}}
+    ITEM = {"id": "x", "history": [], "context": {"installed_apps": {"food_delivery": {}}, "user_profile": {"home_address": "25 Láng Hạ, Đống Đa"},
+                                                  "food_delivery": {"favourites": [{"restaurant_id": "r1"}]}}}
+
+    def run_calls(self, transcript, calls):
+        env = MemoryEnv(); events = []
+        model = ResponsesLLM([*(response(call=c) for c in calls), response()])
+        execute(self.ITEM, transcript, [self.ORDER], env, model, lambda _: "", lambda kind, x: events.append((kind, x)), ground_args=True)
+        return env.calls, events
+
+    def test_spoken_dish_name_is_not_an_item_id(self):
+        calls, events = self.run_calls("đặt hai phần mì xào chay", [("food_delivery__place_order", {"restaurant_id": "r1", "items": [{"item_id": "mì xào chay", "quantity": 2}]})])
+        self.assertEqual(calls, [])
+        self.assertTrue(any("is not an ID returned" in str(x.get("validation")) for kind, x in events if kind == "tool_events"))
+
+    def test_unmentioned_home_address_is_dropped(self):
+        calls, _ = self.run_calls("đặt món", [("food_delivery__place_order", {"restaurant_id": "r1", "items": [], "address": "25 Láng Hạ, Đống Đa"})])
+        self.assertNotIn("address", calls[0]["arguments"])
+        calls, _ = self.run_calls("đặt món giao về nhà", [("food_delivery__place_order", {"restaurant_id": "r1", "items": [], "address": "25 Láng Hạ, Đống Đa"})])
+        self.assertEqual(calls[0]["arguments"]["address"], "25 Láng Hạ, Đống Đa")

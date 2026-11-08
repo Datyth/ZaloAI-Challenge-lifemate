@@ -7,7 +7,7 @@ from typing import Iterator
 
 
 def items(root: Path, split: str) -> Iterator[dict]:
-    if split not in {"train", "public_test"}:
+    if not split.replace("_", "").isalnum():
         raise ValueError(f"unsupported split: {split}")
     path = root / split / f"{split}.jsonl"
     with path.open(encoding="utf-8") as source:

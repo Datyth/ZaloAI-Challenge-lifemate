@@ -1,0 +1,24 @@
+# LifeMate private-test image, laid out as the organizers' guide asks (Docker_Guide_ZAC2026_LifeMate.pdf):
+#   /code/predict.sh  /code/flags.sh  /code/README.md  /code/requirements.txt  /code/src/lifemate (inference code)
+#   /code/models/{llm_base,lora,gipformer}  /code/predict_notebook.ipynb  /code/start_jupyter.sh  /code/training_code
+# Build from the repo root (models/ and outputs/ present on the build machine):
+#   docker build --platform linux/amd64 -f docker/Dockerfile -t zac2026_lifemate_<team>:v1 .
+# Scoring command (guide, section 10):
+#   docker run --rm --gpus '"device=0"' --network none -v /path/to/data:/data:ro -v /path/to/result:/result zac2026_lifemate_<team>:v1 bash /code/predict.sh
+# Base image: vLLM 0.32.0 (the version all runs were made with; it loads Qwen3.5 and runs on A30 and RTX 5090), CUDA <= 13.2.
+FROM vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
+ENTRYPOINT []
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PIP_NO_CACHE_DIR=1 VLLM_NO_USAGE_STATS=1 TOKENIZERS_PARALLELISM=false \
+    PYTHONHASHSEED=0 PYTHONPATH=/code/src TZ=Asia/Ho_Chi_Minh
+WORKDIR /code
+COPY docker/requirements.txt /code/requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /code/requirements.txt
+# weights first, so a code change does not invalidate their layers
+COPY models/qwen3.5-4b/ /code/models/llm_base/
+COPY outputs/sft/FINAL_ADAPTER/ /code/models/lora/
+COPY models/gipformer-lm-v2-01/ /code/models/gipformer/
+COPY build/training_code/ /code/training_code/
+COPY docker/README.md docker/predict.sh docker/flags.sh docker/start_jupyter.sh docker/predict_notebook.ipynb /code/
+COPY src/lifemate /code/src/lifemate
+RUN chmod +x /code/predict.sh /code/start_jupyter.sh
+CMD ["bash", "/code/predict.sh"]

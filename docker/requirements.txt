@@ -1,0 +1,4 @@
+# on top of the vllm/vllm-openai:v0.32.0 image (torch, transformers, vLLM); sherpa-onnx from PyPI is the CPU build used for ASR
+sherpa-onnx==2.0.1
+soundfile==0.14.0
+jupyterlab==4.4.10

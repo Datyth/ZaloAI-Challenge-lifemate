@@ -15,6 +15,7 @@ import sys
 import time
 import wave
 
+from .context import normalize_asr
 from .agent import execute, prompt_for
 from .asr import QwenASR, load_asr
 from .asr_eval import critical_slots, labelled_slices, slot_hits
@@ -153,7 +154,7 @@ def run(args: argparse.Namespace) -> None:
         path = directory / "lifemate_manifest.json"
         return json.loads(path.read_text()) if path.is_file() else None
     use_asr = args.transcript_source in {"asr", "cached-asr"}
-    config = {"split": split, "sample_ids": [x["id"] for x in selected], "seed": 42, "git_sha": git_sha, "kit_version": (root / "VERSION").read_text(), "versions": versions, "asr_model": str(args.asr_dir) if use_asr else None, "asr_backend": args.asr_backend if use_asr else None, "asr_manifest": manifest(args.asr_dir) if use_asr else None, "transcript_source": args.transcript_source, "transcripts_jsonl": str(args.transcripts_jsonl.resolve()) if args.transcripts_jsonl else None, "llm_model": str(args.llm_dir), "llm_manifest": manifest(args.llm_dir), "llm_served_model": args.llm_served_model or str(args.llm_dir), "adapter_dir": str(args.adapter_dir) if args.adapter_dir else None, "adapter_config_sha256": hashlib.sha256((args.adapter_dir / "adapter_config.json").read_bytes()).hexdigest() if args.adapter_dir else None, "adapter_weights_sha256": hashlib.sha256((args.adapter_dir / "adapter_model.safetensors").read_bytes()).hexdigest() if args.adapter_dir else None, "device": args.device, "gpu_name": torch.cuda.get_device_name(int(args.device.split(":", 1)[1])), "prompt_sha256": hashlib.sha256(prompt_for(args.orchestration).encode()).hexdigest(), "parser": args.parser, "orchestration": args.orchestration, "decoding": {"temperature": 0, "seed": 42, "max_tokens": 512}, "deadline_seconds": args.deadline, "max_turns": args.max_turns}
+    config = {"split": split, "sample_ids": [x["id"] for x in selected], "seed": 42, "git_sha": git_sha, "kit_version": (root / "VERSION").read_text(), "versions": versions, "asr_model": str(args.asr_dir) if use_asr else None, "asr_backend": args.asr_backend if use_asr else None, "asr_manifest": manifest(args.asr_dir) if use_asr else None, "transcript_source": args.transcript_source, "transcripts_jsonl": str(args.transcripts_jsonl.resolve()) if args.transcripts_jsonl else None, "llm_model": str(args.llm_dir), "llm_manifest": manifest(args.llm_dir), "llm_served_model": args.llm_served_model or str(args.llm_dir), "adapter_dir": str(args.adapter_dir) if args.adapter_dir else None, "adapter_config_sha256": hashlib.sha256((args.adapter_dir / "adapter_config.json").read_bytes()).hexdigest() if args.adapter_dir else None, "adapter_weights_sha256": hashlib.sha256((args.adapter_dir / "adapter_model.safetensors").read_bytes()).hexdigest() if args.adapter_dir else None, "device": args.device, "gpu_name": torch.cuda.get_device_name(int(args.device.split(":", 1)[1])), "prompt_sha256": hashlib.sha256(prompt_for(args.orchestration).encode()).hexdigest(), "parser": args.parser, "orchestration": args.orchestration, "decoding": {"temperature": 0, "seed": 42, "max_tokens": 512}, "deadline_seconds": args.deadline, "max_turns": args.max_turns, "asr_lowercase": args.asr_lowercase, "dedup_calls": args.dedup_calls, "ground_args": args.ground_args}
     (run_dir / "run_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2))
     (run_dir / "runtime_errors.jsonl").touch()
     specs = catalog(root, split)
@@ -189,7 +190,7 @@ def run(args: argparse.Namespace) -> None:
                     return transcript_cache[relative]
                 saved = saved_transcripts.get((item["id"], relative))
                 if saved is not None:
-                    content = saved["raw_transcript"]
+                    content = normalize_asr(saved["raw_transcript"]) if args.asr_lowercase else saved["raw_transcript"]
                     transcript_cache[relative] = content
                     log("asr_outputs", {**saved, "source": "saved", "transcript_file": str(args.transcripts_jsonl)})
                     return content
@@ -198,6 +199,8 @@ def run(args: argparse.Namespace) -> None:
                 path = audio_path(root, split, relative)
                 t0 = time.monotonic()
                 content = asr.transcribe(path)
+                if args.asr_lowercase:
+                    content = normalize_asr(content)
                 transcript_cache[relative] = content
                 info = audio_info(path)
                 log("asr_outputs", {"sample_id": item["id"], "audio": relative, "model": str(args.asr_dir), "raw_transcript": content, "latency_seconds": time.monotonic() - t0, "source": "inference", **info})
@@ -210,7 +213,7 @@ def run(args: argparse.Namespace) -> None:
                 inference_item = {key: item[key] for key in ("id", "audio", "context", "history")}
                 allowed_history_keys = {"role", "audio", "text", "tool_calls", "tool_results"}
                 inference_item["history"] = [{key: value for key, value in turn.items() if key in allowed_history_keys} for turn in item["history"]]
-                result = execute(inference_item, transcript, installed_tools(inference_item, specs), env, llm, transcribe, log, max_turns=args.max_turns, deadline_seconds=remaining, orchestration=args.orchestration)
+                result = execute(inference_item, transcript, installed_tools(inference_item, specs), env, llm, transcribe, log, max_turns=args.max_turns, deadline_seconds=remaining, orchestration=args.orchestration, dedup_calls=args.dedup_calls, ground_args=args.ground_args)
                 if result["tool_calls"] != env.get_tool_calls() or result["state_hash"] != env.get_state_hash():
                     raise AssertionError("submission row diverged from ToolEnv")
                 elapsed = time.monotonic() - started + cached_asr_seconds
@@ -453,7 +456,10 @@ def main() -> None:
         p.add_argument("--asr-backend", choices=["qwen", "chunkformer", "gipformer"], default="qwen")
         p.add_argument("--allow-failures", action="store_true", help="keep replay-valid rows and error logs for individual failures")
         p.add_argument("--parser", default="hermes")
-        p.add_argument("--orchestration", choices=["E0", "E1", "E2", "E3", "E6", "O1", "O2", "O3", "O4", "O5"], default="E1")
+        p.add_argument("--orchestration", choices=["E0", "E1", "E2", "E3", "E6", "O1", "O2", "O3", "O4", "O5", "S2"], default="E1")
+        p.add_argument("--asr-lowercase", action="store_true", help="lower-case every ASR transcript (current and history) before the agent")
+        p.add_argument("--dedup-calls", action="store_true", help="never execute an identical (name, arguments) call twice in a sample; stop after three repeats")
+        p.add_argument("--ground-args", action="store_true", help="writes: reject ID arguments without x-ref that no tool result, history, context or speech contains; drop optional arguments that only copy an unmentioned context value")
     trace = sub.add_parser("trace")
     trace.add_argument("--sample-id", required=True)
     trace.add_argument("--run-dir", type=Path, required=True)

@@ -78,7 +78,7 @@ class GipformerASR:
         self.recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=str(model_dir / "encoder.onnx"), decoder=str(model_dir / "decoder.onnx"),
             joiner=str(model_dir / "joiner.onnx"), tokens=str(model_dir / "tokens.txt"),
-            num_threads=4, sample_rate=16000, feature_dim=80,
+            num_threads=int(os.environ.get("LIFEMATE_ASR_THREADS", "4")), sample_rate=16000, feature_dim=80,
             decoding_method="modified_beam_search", provider=provider,
         )
 
