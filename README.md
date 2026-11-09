@@ -1,125 +1,129 @@
-# LifeMate offline baseline
+# LifeMate (Zalo AI Challenge 2026, track 1)
 
-This repository contains the organizer's v3.2.0 TRAIN/PUBLIC_TEST kit and a local Qwen3-ASR-0.6B + Qwen3-4B-Instruct-2507 inference runner. See [competition contract](docs/competition_contract.md), [compatibility status](docs/compatibility.md), [measured results](docs/execution_log.md), and [orchestration improvements](docs/orchestration_improvements.md). The model and data directories are ignored by Git.
+Speech request → tool calls on the organizer's `ToolEnv`. The released pipeline (public **58.02**, 2026-11-08):
 
-The E1 QLoRA SFT dataset, training, LoRA evaluation, and paired comparison commands are in [the Agent SFT report](docs/agent_sft_report.md). Full training and validation runs are left for manual execution.
+1. **ASR.** Gipformer 1.5 (68M RNN-T), fine-tuned on the TRAIN audio ("ASR v2"). It runs on CPU with sherpa-onnx (modified beam
+   search, beam 4), and its output is lower-cased.
+2. **LLM.** Qwen3.5-4B (text layers only, non-thinking) with the QLoRA adapter `q35_e1`, served by a local vLLM 0.32.0.
+3. **Agent.** The E1 loop (`src/lifemate/agent.py`) runs on the sample's single ToolEnv.
+   - The model sees structured read-only history.
+   - Every proposed call is schema-validated before it is executed.
+   - An identical call is never executed twice (`--dedup-calls`).
+   - The loop stops after at most 10 LLM turns.
 
-## Best pipeline so far: public 58.02 (2026-11-08)
+Validation on 200 frozen TRAIN ids: **70.91** with ASR, **82.33** with gold transcripts. All model and agent settings are in
+[`configs/release.sh`](configs/release.sh), which the local server, the local runs and the Docker image all source.
 
-Gipformer ASR v2 (fine-tuned on TRAIN audio, lowercased output) -> Qwen3.5-4B + LoRA `q35_e1` served by vLLM -> E1 agent loop on the organizer's ToolEnv. Validation (200 TRAIN ids): 70.91 with ASR, 82.33 with gold transcripts. Details are in [the 2026-11-08 error analysis](docs/error_analysis_2026-11-08.md); the figure is `docs/figures/pipeline.png`.
+The docs are:
+- [docs/competition.md](docs/competition.md): rules, scoring, limits and the Docker contract;
+- [docs/experiments.md](docs/experiments.md): results and decisions;
+- [docs/error_analysis.md](docs/error_analysis.md): error analysis of the release, with the figure in `docs/figures/pipeline.png`;
+- [docker/README.md](docker/README.md): the submission image.
 
-The two fine-tuned checkpoints are in the private Hugging Face repo `hugebenevolence/lifemate-q35e1`; ask for access, then log in with `hf auth login`.
+## Layout
 
-```bash
-bash downloads/get_models.sh        # base models, including Qwen/Qwen3.5-4B at a pinned revision
-bash downloads/get_checkpoint.sh    # LoRA -> outputs/sft/q35_e1_01/adapter, ASR v2 -> models/gipformer-lm-v2-01
-bash scripts/serve_qwen35.sh q35_e1=$(realpath outputs/sft/q35_e1_01/adapter)
-```
+| Path | Content |
+| --- | --- |
+| `src/lifemate/` | Inference package: `cli` (evaluate / submit / validate), `docker_predict` (image entry), `agent`, `asr`, `llm`, `toolenv`, `submission` |
+| `configs/` | `release.sh` (release settings), `splits/validation_ids.json` (frozen 200 TRAIN ids) |
+| `scripts/setup/` | Download base models and the release checkpoints; build the ASR training env |
+| `scripts/data/` | Validation split, agent SFT data, Gipformer SFT data, synthetic-app split |
+| `scripts/train/` | Agent QLoRA SFT, Gipformer fine-tuning and ONNX export |
+| `scripts/infer/` | vLLM server, sharded evaluation, ASR transcript cache, submission merge |
+| `analysis/` | Local scorer (`score.py`) and error analyses |
+| `synth/` | Synthetic apps and tasks (tried, not in the release) |
+| `docker/` | Submission image |
+| `tests/` | Unit tests (`python -m pytest`; the tests that need the kit skip without `data/`) |
 
-In a second terminal, run the agent with the settings of the 58.02 run:
+`data/`, `models/`, `outputs/` and `result/` are git-ignored. The organizer kit goes to `data/train+public_test/`.
 
-```bash
-export LIFEMATE_MERGE_SYSTEM=1
-export LIFEMATE_LLM_EXTRA='{"chat_template_kwargs": {"enable_thinking": false}}'
-DEADLINE=900 SPLIT=public_test ASR_DIR=models/gipformer-lm-v2-01 CACHE=outputs/asr/gipformer-lm-v2-01_public/asr_outputs.jsonl \
-  ADAPTER=outputs/sft/q35_e1_01/adapter SERVED=q35_e1 EXTRA="--asr-lowercase --dedup-calls --llm-dir models/qwen3.5-4b --max-turns 10" \
-  bash analysis/run_shards.sh pub_q35e1 outputs/splits/public_ids.json 4 asr sft E1
-.venv/bin/python analysis/merge_submission.py pub_q35e1 --split public_test --output result/submission.jsonl
-```
-
-`run_shards.sh` reads ASR transcripts from the `CACHE` file (ASR v2, CPU, modified beam search, beam 4) instead of decoding audio itself. Without that cache, `PYTHONPATH=src python -m lifemate.docker_predict --data <split dir> --out <dir> --model q35_e1` runs the same pipeline with ASR inline (12/12 public rows identical to the cached run).
-
-## Compare Vietnamese ASR models on TRAIN
-
-The ASR benchmark compares the preserved Qwen3-ASR-0.6B run with local ChunkFormer-RNNT-Large-Vie and Gipformer 1.5 checkpoints on the same frozen 200 TRAIN IDs. The two new adapters use the existing `benchmark-asr` interface. Run the full comparison on physical GPU 2 with:
-
-```bash
-cd /home/datpt/projects/ZaloAI-Challenge-lifemate
-source /home/shared/miniconda3/etc/profile.d/conda.sh
-conda activate datpt_lifemate
-nohup bash scripts/run_asr_comparison.sh cuda:2 asr_compare_manual_01 > outputs/asr_compare_manual_01.log 2>&1 &
-echo "ASR benchmark PID: $!"
-```
-
-Use a new prefix for each attempt. The script does not require the vLLM server. It writes separate `asr_outputs.jsonl`, `per_sample.jsonl`, and `errors.jsonl` files for each new model under `outputs/runs/<prefix>_<model>/`, then writes `outputs/reports/<prefix>/report.md`. See [ASR benchmark details](docs/asr_benchmark.md) for measured results, metric definitions, and dataset limits.
-
-For the end-to-end A0–A3 comparison with the unchanged E1 Agent, see [the E1 × ASR benchmark instructions](docs/e1_asr_comparison.md). The runner reuses A0 and oracle A3, prepares history audio caches for ChunkFormer and Gipformer, then runs A1/A2 sequentially and reports paired state transitions. One-sample smoke tests passed; the full A1/A2 runs are left for the user to launch.
-
-The baseline checkpoints are downloaded and `datpt_lifemate` ran real-model experiments on physical GPU 2. On the fixed 200-sample TRAIN comparison, E1 had the best completed result: 52/200 final-state matches, exact-call F1 surrogate 0.2395, and zero failures. E2 also matched 52/200 states but failed four samples. E1 is now the CLI default. No official score is available. The existing `result/submission.jsonl` has 634 PUBLIC_TEST rows and passed CPU ToolEnv replay validation with 634 matching hashes; it remains the earlier E0 artifact.
-
-## Run E4–E6 TRAIN optimization
-
-E1 remains the default baseline. `scripts/run_agent_optimization.sh` runs E4 with TRAIN reference transcripts, writes an E5 analysis of the 148 E1 failures, then runs E6 and E6 with oracle transcripts on the same frozen 200 IDs. The script writes separate run directories and regenerates [the optimization report](docs/agent_optimization_report.md). The `agentopt_full_01` run completed all stages with no sample failures.
-
-In terminal 1, activate the requested environment and start the GPU 2 LLM server:
+## Setup
 
 ```bash
-cd /home/datpt/projects/ZaloAI-Challenge-lifemate
-source /home/shared/miniconda3/etc/profile.d/conda.sh
-conda activate datpt_lifemate
-bash scripts/serve_llm.sh
+uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -e '.[infer,test]'
+bash scripts/setup/get_models.sh      # Qwen3.5-4B and the original Gipformer at pinned revisions -> models/
+bash scripts/setup/get_checkpoint.sh  # release LoRA + ASR v2 (private HF repo, `hf auth login`) -> outputs/release/lifemate-q35e1/
+.venv/bin/python scripts/data/make_validation_split.py   # writes configs/splits/validation_ids.json, or checks it if present
 ```
 
-In terminal 2, activate the same environment and run the experiments. Give each full attempt a new prefix; an incomplete stage keeps its `.partial` file and the script will stop rather than overwrite it.
+The training environments are separate:
+- `.venv-train` for agent SFT: `uv pip install -e '.[sft]'`;
+- `.venv-asr` for Gipformer fine-tuning with torch 2.8, k2, kaldifeat and icefall: `bash scripts/setup/setup_asr_env.sh`.
+
+## Evaluate
 
 ```bash
-cd /home/datpt/projects/ZaloAI-Challenge-lifemate
-source /home/shared/miniconda3/etc/profile.d/conda.sh
-conda activate datpt_lifemate
-bash scripts/run_agent_optimization.sh cuda:2 agentopt_full_01 2>&1 | tee outputs/agentopt_full_01.log
+bash scripts/infer/serve.sh            # terminal 1: vLLM on 127.0.0.1:8000, base + release LoRA served as "lifemate"
+# terminal 2: ASR transcripts of the validation samples (CPU), then 4 parallel shards of the agent, then the score
+.venv/bin/python scripts/infer/asr_cache.py --split train --ids configs/splits/validation_ids.json \
+  --model-dir models/gipformer-lm-v2-01 --output-dir outputs/asr/gipformer-lm-v2-01_val
+bash scripts/infer/run_shards.sh v200 configs/splits/validation_ids.json 4 asr sft
+bash scripts/infer/run_shards.sh v200_oracle configs/splits/validation_ids.json 4 oracle sft   # gold transcripts
+.venv/bin/python analysis/score.py outputs/runs/v200 outputs/runs/v200_oracle
+.venv/bin/python analysis/errors.py --asr v200 --oracle v200_oracle    # error groups and per-case files
 ```
 
-The baseline E1 run is `outputs/runs/train200_20261105_115719_E1`. Raw oracle transcript pairs, E5 per-sample evidence, and the four-way comparison are written under `outputs/reports/agentopt_full_01/`. Select E6 for PUBLIC_TEST only if the completed TRAIN report supports it.
+`run_shards.sh` exits non-zero if any shard fails. You can override its defaults through the environment:
+- `ADAPTER` / `SERVED` for another LoRA;
+- `CACHE` for another transcript file;
+- `DEADLINE` (default 900 s, because the shards share one GPU);
+- `EXTRA` for more `lifemate.cli evaluate` flags.
 
-## Generate a new PUBLIC_TEST submission when GPUs are available
+To compare adapters, serve them side by side with `bash scripts/infer/serve.sh name=dir ...`.
 
-Use two terminals from this repository. In terminal 1, start the local vLLM server. If `curl http://127.0.0.1:8000/v1/models` already returns this checkpoint, keep that server and skip the start command.
+## Submit (public test)
 
 ```bash
-cd /home/datpt/projects/ZaloAI-Challenge-lifemate
-source /home/shared/miniconda3/etc/profile.d/conda.sh
-conda activate datpt_lifemate
-bash scripts/serve_llm.sh
+.venv/bin/python scripts/infer/asr_cache.py --split public_test --model-dir models/gipformer-lm-v2-01 \
+  --output-dir outputs/asr/gipformer-lm-v2-01_public
+SPLIT=public_test bash scripts/infer/run_shards.sh pub all 4 asr sft
+.venv/bin/python scripts/infer/merge_submission.py pub --split public_test --output result/submission.jsonl
+PYTHONPATH=data/train+public_test/public_test .venv/bin/python -m zaic_tools --split public_test \
+  --root data/train+public_test --validate result/submission.jsonl
 ```
 
-In terminal 2, run all 634 PUBLIC_TEST samples on physical GPU 2, then validate the complete output with both the project replay check and the organizer's validator. Do not set `CUDA_VISIBLE_DEVICES=2` in terminal 2; that setting is local to the vLLM process in terminal 1.
+`merge_submission.py` refuses to write in these cases:
+- a shard is unfinished;
+- an id is missing or duplicated;
+- a sample failed at runtime (`runtime_errors.jsonl`), unless you pass `--allow-failures`;
+- the merged file does not replay through ToolEnv to the same hashes.
+
+It also never overwrites an existing file.
+
+The Docker path (`lifemate.docker_predict`) decodes the audio inline and gave rows identical to the cached run (12/12). It needs a
+folder that holds only one split:
 
 ```bash
-cd /home/datpt/projects/ZaloAI-Challenge-lifemate
-source /home/shared/miniconda3/etc/profile.d/conda.sh
-conda activate datpt_lifemate
-export PYTHONPATH=src
-set -e
-python -m lifemate.cli submit --split public_test --device cuda:2 --orchestration E1 --output result/submission.jsonl
-python -m lifemate.cli validate-submission --split public_test --file result/submission.jsonl
-PYTHONPATH=data/train+public_test/public_test python -m zaic_tools --split public_test --root data/train+public_test --validate result/submission.jsonl
+mkdir -p /tmp/pub && ln -sfn "$PWD/data/train+public_test/public_test" /tmp/pub/public_test
+source configs/release.sh && PYTHONPATH=src .venv/bin/python -m lifemate.docker_predict --data /tmp/pub --out /tmp/pub_out \
+  --asr-dir models/gipformer-lm-v2-01
 ```
 
-The runner writes per-sample ASR, LLM, and tool traces to `outputs/runs/<run-id>/`, reports progress every 25 samples, and writes `result/submission.jsonl` only if every sample succeeds and replay validation passes. The full run may take roughly an hour based on the small TRAIN run; this is an estimate, not a measured full-run time. If it stops early, inspect the latest run directory and do not submit a `.partial` file. `set -e` prevents validation commands from running when inference fails.
+To build and run the image, see [docker/README.md](docker/README.md).
 
-## Historical recovery procedure for the 2026-11-04 interrupted full run
+## Train
 
-The run `20261104T192413_submit_570038` produced 634 replayable diagnostic rows but flagged `public_0392` and `public_0421` for exceeding 10 LLM turns. With the local vLLM server running, rerun only those two samples with a higher turn limit, then merge their successful rows with the other 632. This does not rerun the full dataset:
+The 200 validation ids, and every sample that shares a history recording with them, are excluded from all training data. Each
+data script records the sha256 of `configs/splits/validation_ids.json` in its manifest.
+
+**Agent adapter (`q35_e1`):**
 
 ```bash
-cd /home/datpt/projects/ZaloAI-Challenge-lifemate
-source /home/shared/miniconda3/etc/profile.d/conda.sh
-conda activate datpt_lifemate
-export PYTHONPATH=src
-set -e
-python -m lifemate.cli submit --split public_test --sample-id public_0392 --max-turns 20 --device cuda:2 --output result/retry_public_0392.jsonl
-python -m lifemate.cli submit --split public_test --sample-id public_0421 --max-turns 20 --device cuda:2 --output result/retry_public_0421.jsonl
-python scripts/recover_submission.py --run-dir outputs/runs/20261104T192413_submit_570038 --partial result/submission.jsonl.20261104T192413_submit_570038.partial --replacement public_0392=result/retry_public_0392.jsonl --replacement public_0421=result/retry_public_0421.jsonl --output result/submission.jsonl
-python -m lifemate.cli validate-submission --split public_test --file result/submission.jsonl
-PYTHONPATH=data/train+public_test/public_test python -m zaic_tools --split public_test --root data/train+public_test --validate result/submission.jsonl
+.venv/bin/python scripts/infer/asr_cache.py --split train --output-dir outputs/asr/gipformer_train   # original Gipformer, all TRAIN audio
+.venv/bin/python scripts/data/prepare_agent_sft.py --orchestration E1 --variants gold,asr --output-dir outputs/sft/data_v2_e1
+.venv-train/bin/python scripts/train/train_agent_sft.py --data-dir outputs/sft/data_v2_e1 --out outputs/sft/q35_e1_01 \
+  --model models/qwen3.5-4b --epochs 2 --lr 1e-4    # QLoRA r16, max_len 16384; about 3 h on one 24 GB GPU
 ```
 
-If either targeted retry still fails, inspect its new run log and do not run the merge step. The recovery script checks both replacement files and replays all 634 merged rows with the organizer's ToolEnv before writing the final file.
-
-After the first full submission validates, the remaining checkpoint download is unlocked:
+**ASR v2 (`gipformer-lm-v2-01`):**
 
 ```bash
-python -m lifemate.cli download --group remaining
+.venv/bin/python scripts/data/prepare_gipformer_sft.py --output-dir outputs/asr_sft/gipformer_data
+.venv-asr/bin/python scripts/train/train_gipformer.py --data-dir outputs/asr_sft/gipformer_data \
+  --output-dir outputs/asr_sft/gipformer_v2 --physical-gpu 0 --train-all   # lr 2e-5, accum 4, 2 epochs (defaults)
+bash scripts/train/export_gipformer.sh outputs/asr_sft/gipformer_v2 gipformer-lm-v2-01   # ONNX + WER on the validation audio
 ```
 
-Model comparison has not run. It must use real TRAIN measurements and check legal parameter totals before pair selection. See [model comparison status](outputs/reports/model_comparison.md), which is a local ignored artifact.
+**Synthetic apps (not in the release):**
+- `scripts/data/build_synth_split.py` builds `outputs/synth`;
+- then run `prepare_agent_sft.py --split synth --data-root outputs/synth`.

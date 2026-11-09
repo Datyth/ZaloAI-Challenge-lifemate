@@ -5,6 +5,11 @@ import json
 from pathlib import Path
 from typing import Iterator
 
+PROJECT = Path(__file__).resolve().parents[2]
+DATA_ROOT = PROJECT / "data" / "train+public_test"
+# Frozen 200 TRAIN ids used for every validation number; excluded (with their shared history audio) from all training data.
+VALIDATION_IDS = PROJECT / "configs" / "splits" / "validation_ids.json"
+
 
 def items(root: Path, split: str) -> Iterator[dict]:
     if not split.replace("_", "").isalnum():

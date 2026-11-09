@@ -130,7 +130,7 @@ def run_scores(prefix: str, items: dict) -> dict[str, dict]:
 def transcripts(prefix: str) -> dict[str, str]:
     """Current-utterance transcript each sample was run with (from the run's asr_outputs log)."""
     found = {}
-    for d in sorted((PROJECT / "outputs/runs").glob(prefix + "_s*")):
+    for d in S.shard_dirs(PROJECT / "outputs/runs" / prefix):
         f = d / "asr_outputs.jsonl"
         if f.is_file():
             for line in f.open(encoding="utf-8"):
@@ -142,7 +142,7 @@ def transcripts(prefix: str) -> dict[str, str]:
 
 def run_events(prefix: str) -> dict[str, collections.Counter]:
     ev = collections.defaultdict(collections.Counter)
-    for d in sorted((PROJECT / "outputs/runs").glob(prefix + "_s*")):
+    for d in S.shard_dirs(PROJECT / "outputs/runs" / prefix):
         for name, key in (("tool_events.jsonl", "tool"), ("protocol_events.jsonl", "protocol"), ("llm_turns.jsonl", "turn")):
             f = d / name
             if not f.is_file():

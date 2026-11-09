@@ -43,6 +43,7 @@ class Predictor:
         self.asr = GipformerASR(asr_dir, device="cpu")
         self.llm = LocalChat(llm_url, model, timeout=deadline)
         self.deadline, self.max_turns = deadline, max_turns
+        self.failed: list[str] = []                       # ids whose agent loop raised; their lines keep the calls made
 
     def samples(self) -> list[dict]:
         return list(items(self.root, self.split))
@@ -64,6 +65,7 @@ class Predictor:
             execute(view, transcript, installed_tools(view, self.specs), env, self.llm, transcribe, log, max_turns=self.max_turns,
                     deadline_seconds=self.deadline - (time.perf_counter() - t1), orchestration="E1", dedup_calls=True)
         except Exception as exc:  # the line is still written from the ToolEnv
+            self.failed.append(item["id"])
             log("error", {"sample_id": item["id"], "error": f"{type(exc).__name__}: {exc}"})
         return {"id": item["id"], "tool_calls": env.get_tool_calls(), "state_hash": env.get_state_hash(), "time": int((time.perf_counter() - t1) * 1000)}
 
@@ -97,7 +99,8 @@ def main() -> None:
             fout.flush()
             if k % 50 == 0 or k == len(selected):
                 print(f"lifemate: {k}/{len(selected)} samples, mean {sum(times) / len(times):.0f} ms, max {max(times)} ms", flush=True)
-    print(f"lifemate: wrote {a.out / 'submission.jsonl'} ({len(selected)} lines)", flush=True)
+    print(f"lifemate: wrote {a.out / 'submission.jsonl'} ({len(selected)} lines, {len(pred.failed)} failed samples"
+          f"{': ' + ' '.join(pred.failed) if pred.failed else ''}; details in logs/trace.jsonl)", flush=True)
 
 
 if __name__ == "__main__":

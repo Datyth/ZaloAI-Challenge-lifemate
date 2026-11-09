@@ -9,7 +9,6 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
@@ -17,21 +16,16 @@ import wave
 
 from .context import normalize_asr
 from .agent import execute, prompt_for
-from .asr import QwenASR, load_asr
-from .asr_eval import critical_slots, labelled_slices, slot_hits
-from .data import audio_path, catalog, installed_tools, items
+from .asr import GipformerASR
+from .data import DATA_ROOT as DEFAULT_ROOT, PROJECT, audio_path, catalog, installed_tools, items
 from .llm import LocalChat
 from .metrics import error_counts, exact_tool_f1
-from .models import stored_parameters
 from .toolenv import new_env
 from .submission import validate_file
 
-DEFAULT_ROOT = Path(__file__).resolve().parents[2] / "data" / "train+public_test"
-PROJECT = Path(__file__).resolve().parents[2]
-ASR_DIR = PROJECT / "models" / "qwen3-asr-0.6b"
-LLM_DIR = PROJECT / "models" / "qwen3-4b-instruct-2507"
-CHUNKFORMER_DIR = PROJECT / "models" / "chunkformer-rnnt-large-vie"
-GIPFORMER_DIR = PROJECT / "models" / "gipformer1.5-68m-rnnt"
+# Released checkpoints (scripts/setup/get_models.sh, get_checkpoint.sh); ASR runs on CPU, the LLM in a local vLLM server.
+ASR_DIR = PROJECT / "models" / "gipformer-lm-v2-01"
+LLM_DIR = PROJECT / "models" / "qwen3.5-4b"
 
 
 def write_jsonl(path: Path, row: dict) -> None:
@@ -89,13 +83,10 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("no samples selected")
     if args.transcript_source == "train-reference" and (split != "train" or args.command == "submit"):
         raise ValueError("TRAIN reference transcripts are allowed only for TRAIN smoke/evaluate")
-    if args.transcript_source == "asr" and args.asr_backend == "gipformer":
-        raise ValueError("Gipformer uses an isolated ONNX CUDA device; prepare a cache and use cached-asr")
     if not (args.llm_dir / "config.json").is_file():
         raise FileNotFoundError(f"LLM checkpoint missing: {args.llm_dir}")
     if args.transcript_source in {"asr", "cached-asr"}:
-        required = {"qwen": "config.json", "chunkformer": "pytorch_model.pt", "gipformer": "encoder.onnx"}
-        if not (args.asr_dir / required[args.asr_backend]).is_file():
+        if not (args.asr_dir / "encoder.onnx").is_file():
             raise FileNotFoundError(f"ASR checkpoint missing: {args.asr_dir}")
     saved_transcripts: dict[tuple[str, str], dict] = {}
     if args.transcript_source == "cached-asr":
@@ -134,7 +125,7 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("CUDA unavailable; run inference with GPU device access enabled")
     if not args.device.startswith("cuda:") or int(args.device.split(":", 1)[1]) >= torch.cuda.device_count():
         raise RuntimeError(f"Requested GPU {args.device} is unavailable; detected {torch.cuda.device_count()} CUDA devices")
-    asr = load_asr(args.asr_backend, args.asr_dir, args.device) if args.transcript_source == "asr" else None
+    asr = GipformerASR(args.asr_dir, device="cpu") if args.transcript_source == "asr" else None  # as in the Docker image
     llm = LocalChat(args.llm_url, args.llm_served_model or str(args.llm_dir), timeout=args.deadline)
     stamp = time.strftime("%Y%m%dT%H%M%S")
     run_id = args.run_id or f"{stamp}_{args.command}_{time.time_ns() % 1000000:06d}"
@@ -145,7 +136,7 @@ def run(args: argparse.Namespace) -> None:
     except (OSError, subprocess.CalledProcessError):
         git_sha = None
     versions = {}
-    for package in ("torch", "qwen-asr", "vllm", "transformers", "huggingface-hub"):
+    for package in ("torch", "sherpa-onnx", "vllm", "transformers", "huggingface-hub"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
@@ -154,7 +145,7 @@ def run(args: argparse.Namespace) -> None:
         path = directory / "lifemate_manifest.json"
         return json.loads(path.read_text()) if path.is_file() else None
     use_asr = args.transcript_source in {"asr", "cached-asr"}
-    config = {"split": split, "sample_ids": [x["id"] for x in selected], "seed": 42, "git_sha": git_sha, "kit_version": (root / "VERSION").read_text(), "versions": versions, "asr_model": str(args.asr_dir) if use_asr else None, "asr_backend": args.asr_backend if use_asr else None, "asr_manifest": manifest(args.asr_dir) if use_asr else None, "transcript_source": args.transcript_source, "transcripts_jsonl": str(args.transcripts_jsonl.resolve()) if args.transcripts_jsonl else None, "llm_model": str(args.llm_dir), "llm_manifest": manifest(args.llm_dir), "llm_served_model": args.llm_served_model or str(args.llm_dir), "adapter_dir": str(args.adapter_dir) if args.adapter_dir else None, "adapter_config_sha256": hashlib.sha256((args.adapter_dir / "adapter_config.json").read_bytes()).hexdigest() if args.adapter_dir else None, "adapter_weights_sha256": hashlib.sha256((args.adapter_dir / "adapter_model.safetensors").read_bytes()).hexdigest() if args.adapter_dir else None, "device": args.device, "gpu_name": torch.cuda.get_device_name(int(args.device.split(":", 1)[1])), "prompt_sha256": hashlib.sha256(prompt_for(args.orchestration).encode()).hexdigest(), "parser": args.parser, "orchestration": args.orchestration, "decoding": {"temperature": 0, "seed": 42, "max_tokens": 512}, "deadline_seconds": args.deadline, "max_turns": args.max_turns, "asr_lowercase": args.asr_lowercase, "dedup_calls": args.dedup_calls, "ground_args": args.ground_args}
+    config = {"split": split, "sample_ids": [x["id"] for x in selected], "seed": 42, "git_sha": git_sha, "kit_version": (root / "VERSION").read_text(), "versions": versions, "asr_model": str(args.asr_dir) if use_asr else None, "asr_manifest": manifest(args.asr_dir) if use_asr else None, "transcript_source": args.transcript_source, "transcripts_jsonl": str(args.transcripts_jsonl.resolve()) if args.transcripts_jsonl else None, "llm_model": str(args.llm_dir), "llm_manifest": manifest(args.llm_dir), "llm_served_model": args.llm_served_model or str(args.llm_dir), "adapter_dir": str(args.adapter_dir) if args.adapter_dir else None, "adapter_config_sha256": hashlib.sha256((args.adapter_dir / "adapter_config.json").read_bytes()).hexdigest() if args.adapter_dir else None, "adapter_weights_sha256": hashlib.sha256((args.adapter_dir / "adapter_model.safetensors").read_bytes()).hexdigest() if args.adapter_dir else None, "device": args.device, "gpu_name": torch.cuda.get_device_name(int(args.device.split(":", 1)[1])), "prompt_sha256": hashlib.sha256(prompt_for(args.orchestration).encode()).hexdigest(), "orchestration": args.orchestration, "decoding": {"temperature": 0, "seed": 42, "max_tokens": 512}, "deadline_seconds": args.deadline, "max_turns": args.max_turns, "asr_lowercase": args.asr_lowercase, "dedup_calls": args.dedup_calls, "ground_args": args.ground_args}
     (run_dir / "run_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2))
     (run_dir / "runtime_errors.jsonl").touch()
     specs = catalog(root, split)
@@ -282,158 +273,10 @@ def run(args: argparse.Namespace) -> None:
     print(f"wrote {len(selected)} rows: {destination}")
 
 
-def benchmark_asr(args: argparse.Namespace) -> None:
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    model_dirs = {"qwen": ASR_DIR, "chunkformer": CHUNKFORMER_DIR, "gipformer": GIPFORMER_DIR}
-    model_dir = (args.asr_dir or model_dirs[args.model]).resolve()
-    root = args.data_root.resolve()
-    rows = list(items(root, "train"))
-    if args.sample_ids:
-        wanted = set(json.loads(args.sample_ids.read_text()))
-        rows = [row for row in rows if row["id"] in wanted]
-        if {row["id"] for row in rows} != wanted:
-            raise ValueError("sample ID file contains unknown TRAIN IDs")
-    if args.sample_id:
-        rows = [row for row in rows if row["id"] == args.sample_id]
-    if args.limit:
-        rows = rows[:args.limit]
-    if not rows:
-        raise ValueError("no TRAIN samples selected")
-    if args.device.startswith("cuda:") and args.model != "gipformer":
-        import torch
-        if not torch.cuda.is_available() or int(args.device.split(":", 1)[1]) >= torch.cuda.device_count():
-            raise RuntimeError(f"Requested device {args.device} unavailable")
-    run_dir = PROJECT / "outputs" / "runs" / (args.run_id or f"{time.strftime('%Y%m%dT%H%M%S')}_benchmark_asr")
-    run_dir.mkdir(parents=True, exist_ok=False)
-    manifest_path = model_dir / "lifemate_manifest.json"
-    config = {"split": "train", "sample_ids": [row["id"] for row in rows], "seed": 42,
-              "model_name": args.model, "model": str(model_dir), "device": args.device,
-              "manifest": json.loads(manifest_path.read_text()) if manifest_path.is_file() else None,
-              "normalization": "lowercase Unicode words; no number verbalization",
-              "critical_slot_definition": "exact normalized lexical preservation of explicitly spoken gold argument values"}
-    (run_dir / "run_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
-    for name in ("asr_outputs.jsonl", "per_sample.jsonl", "errors.jsonl"):
-        (run_dir / name).touch()
-    t_load = time.monotonic()
-    model = load_asr(args.model, model_dir, args.device)
-    load_seconds = time.monotonic() - t_load
-    counts = {"word_errors": 0, "reference_words": 0, "character_errors": 0, "reference_characters": 0}
-    durations: list[float] = []
-    slot_total = slot_correct = failures = 0
-    slices: dict[str, list[dict]] = {}
-    for row in rows:
-        path = audio_path(root, "train", row["audio"])
-        info = audio_info(path)
-        start = time.monotonic()
-        try:
-            transcript = model.transcribe(path)
-            elapsed = time.monotonic() - start
-            sample_counts = error_counts(row["audio_text"], transcript)
-            slots = slot_hits(critical_slots(row["audio_text"], row["label"]["tool_calls"]), transcript)
-            groups = labelled_slices(row, info)
-            result = {"sample_id": row["id"], "reference": row["audio_text"], "transcript": transcript,
-                      "latency_seconds": elapsed, "counts": sample_counts, "critical_slots": slots,
-                      "critical_slot_eligible": len(slots), "critical_slot_correct": sum(x["matched"] for x in slots),
-                      "slices": groups, "status": "ok", **info}
-            write_jsonl(run_dir / "asr_outputs.jsonl", {"sample_id": row["id"], "audio": row["audio"],
-                        "model": str(model_dir), "raw_transcript": transcript, "latency_seconds": elapsed, **info})
-            write_jsonl(run_dir / "per_sample.jsonl", result)
-            durations.append(elapsed)
-            slot_total += len(slots)
-            slot_correct += result["critical_slot_correct"]
-            for key, value in sample_counts.items():
-                counts[key] += value
-            for group in groups:
-                slices.setdefault(group, []).append(result)
-        except Exception as exc:
-            failures += 1
-            error = {"sample_id": row["id"], "audio": row["audio"], "error": f"{type(exc).__name__}: {exc}",
-                     "latency_seconds": time.monotonic() - start}
-            write_jsonl(run_dir / "errors.jsonl", error)
-            write_jsonl(run_dir / "per_sample.jsonl", {**error, "status": "error"})
-        if len(durations) + failures > 0 and (len(durations) + failures) % 25 == 0:
-            print(f"ASR {args.model}: {len(durations) + failures}/{len(rows)}; failures={failures}", file=sys.stderr, flush=True)
-    ordered = sorted(durations)
-    slice_metrics = {}
-    for name, members in sorted(slices.items()):
-        total_words = sum(x["counts"]["reference_words"] for x in members)
-        total_chars = sum(x["counts"]["reference_characters"] for x in members)
-        eligible = sum(x["critical_slot_eligible"] for x in members)
-        slice_metrics[name] = {"samples": len(members),
-                               "wer": sum(x["counts"]["word_errors"] for x in members) / total_words if total_words else None,
-                               "cer": sum(x["counts"]["character_errors"] for x in members) / total_chars if total_chars else None,
-                               "critical_slot_accuracy": sum(x["critical_slot_correct"] for x in members) / eligible if eligible else None,
-                               "critical_slot_eligible": eligible,
-                               "latency_mean_seconds": sum(x["latency_seconds"] for x in members) / len(members)}
-    metrics = {"samples": len(rows), "successes": len(durations), "failures": failures,
-               "asr_wer": counts["word_errors"] / counts["reference_words"] if counts["reference_words"] else None,
-               "asr_cer": counts["character_errors"] / counts["reference_characters"] if counts["reference_characters"] else None,
-               "critical_slot_accuracy": slot_correct / slot_total if slot_total else None,
-               "critical_slot_correct": slot_correct, "critical_slot_eligible": slot_total,
-               "asr_latency_mean_seconds": sum(durations) / len(durations) if durations else None,
-               "asr_latency_p95_seconds": ordered[(95 * len(ordered) + 99) // 100 - 1] if ordered else None,
-               "asr_latency_max_seconds": max(durations) if durations else None,
-               "model_load_seconds": load_seconds, "slices": slice_metrics,
-               "unavailable_labelled_slices": [name for name, prefix in (("regional_accents", "accent:"), ("noisy_speech", "noisy_labelled"), ("truncated_utterances", "truncated_labelled")) if not any(key.startswith(prefix) for key in slice_metrics)],
-               "reference": "TRAIN audio_text; lowercase Unicode word normalization"}
-    (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
-    with (run_dir / "summary.csv").open("w", encoding="utf-8", newline="") as summary:
-        writer = csv.DictWriter(summary, fieldnames=list(metrics))
-        writer.writeheader()
-        writer.writerow(metrics)
-    print(json.dumps({"run_dir": str(run_dir), **metrics}, indent=2))
-
-
-def download(group: str) -> None:
-    if group == "remaining":
-        first = PROJECT / "result" / "submission.jsonl"
-        if not first.is_file():
-            raise RuntimeError("First validated public submission is required before remaining downloads")
-        rows = [json.loads(line) for line in first.open(encoding="utf-8") if line.strip()]
-        expected = {x["id"] for x in items(DEFAULT_ROOT, "public_test")}
-        if len(rows) != len(expected) or {r.get("id") for r in rows} != expected or any(set(r) != {"id", "tool_calls", "state_hash"} for r in rows):
-            raise RuntimeError("First public submission has not passed shape and ID validation")
-        validate_file(DEFAULT_ROOT, "public_test", first)
-    os.environ["HF_HOME"] = str(PROJECT / "models" / ".hf_home")
-    try:
-        from huggingface_hub import HfApi, snapshot_download
-    except ImportError as exc:
-        raise RuntimeError("Install huggingface-hub before downloading") from exc
-    candidates = [("Qwen/Qwen3-ASR-0.6B", ASR_DIR), ("Qwen/Qwen3-4B-Instruct-2507", LLM_DIR)] if group == "baseline" else [
-        ("vinai/PhoWhisper-large", PROJECT / "models" / "phowhisper-large"),
-        ("FunAudioLLM/Fun-ASR-MLT-Nano-2512", PROJECT / "models" / "fun-asr-mlt-nano-2512"),
-        ("Qwen/Qwen3.5-4B", PROJECT / "models" / "qwen3.5-4b"),
-        ("Qwen/Qwen3.5-2B", PROJECT / "models" / "qwen3.5-2b")]
-    for repo, dest in candidates:
-        free = shutil.disk_usage(PROJECT).free
-        if free < 20 * 1024**3:
-            raise RuntimeError(f"Insufficient free disk before {repo}: {free / 1024**3:.1f} GiB")
-        dest.mkdir(parents=True, exist_ok=True)
-        print(f"downloading {repo} to {dest}", flush=True)
-        info = HfApi().model_info(repo)
-        snapshot_download(repo_id=repo, revision=info.sha, local_dir=dest)
-        count, weight_bytes = stored_parameters(dest)
-        manifest = {"repo_id": repo, "revision": info.sha, "created_at": str(info.created_at), "license": getattr(info.card_data, "license", None), "stored_tensor_parameters": count, "weight_bytes": weight_bytes, "note": "Stored tensor count may exclude tied weights; complete architecture audit required before declaring a legal pair."}
-        (dest / "lifemate_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        print(json.dumps(manifest), flush=True)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(prog="lifemate")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("inspect")
-    down = sub.add_parser("download")
-    down.add_argument("--group", choices=["baseline", "remaining"], required=True)
-    asr_bench = sub.add_parser("benchmark-asr")
-    asr_bench.add_argument("--data-root", type=Path, default=DEFAULT_ROOT)
-    asr_bench.add_argument("--sample-id")
-    asr_bench.add_argument("--sample-ids", type=Path)
-    asr_bench.add_argument("--limit", type=int)
-    asr_bench.add_argument("--asr-dir", type=Path)
-    asr_bench.add_argument("--model", choices=["qwen", "chunkformer", "gipformer"], default="qwen")
-    asr_bench.add_argument("--device", default="cuda:2")
-    asr_bench.add_argument("--run-id")
     for name in ("smoke", "evaluate", "submit"):
         p = sub.add_parser(name)
         p.add_argument("--split", choices=["train", "public_test"], default="public_test" if name == "submit" else "train")
@@ -448,14 +291,12 @@ def main() -> None:
         p.add_argument("--llm-served-model", help="vLLM LoRA model ID; requires --adapter-dir")
         p.add_argument("--adapter-dir", type=Path, help="PEFT adapter used by the local vLLM server")
         p.add_argument("--deadline", type=float, default=30)
-        p.add_argument("--device", default="cuda:2")
+        p.add_argument("--device", default="cuda:0", help="GPU recorded in run_config (the LLM runs in the vLLM server)")
         p.add_argument("--run-id")
         p.add_argument("--max-turns", type=int, default=10)
         p.add_argument("--transcript-source", choices=["asr", "cached-asr", "train-reference"], default="asr")
         p.add_argument("--transcripts-jsonl", type=Path)
-        p.add_argument("--asr-backend", choices=["qwen", "chunkformer", "gipformer"], default="qwen")
         p.add_argument("--allow-failures", action="store_true", help="keep replay-valid rows and error logs for individual failures")
-        p.add_argument("--parser", default="hermes")
         p.add_argument("--orchestration", choices=["E0", "E1", "E2", "E3", "E6", "O1", "O2", "O3", "O4", "O5", "S2"], default="E1")
         p.add_argument("--asr-lowercase", action="store_true", help="lower-case every ASR transcript (current and history) before the agent")
         p.add_argument("--dedup-calls", action="store_true", help="never execute an identical (name, arguments) call twice in a sample; stop after three repeats")
@@ -477,10 +318,6 @@ def main() -> None:
         except ImportError:
             cuda = None
         print(json.dumps({"root": str(root), "train": sum(1 for _ in items(root, "train")), "public_test": sum(1 for _ in items(root, "public_test")), "cuda": cuda}, indent=2))
-    elif args.command == "download":
-        download(args.group)
-    elif args.command == "benchmark-asr":
-        benchmark_asr(args)
     elif args.command == "trace":
         for name in ("asr_outputs", "llm_turns", "tool_events", "protocol_events", "terminations", "predictions"):
             path = args.run_dir / f"{name}.jsonl"

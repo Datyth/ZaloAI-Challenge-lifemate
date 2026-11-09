@@ -4,12 +4,9 @@ outputs/
 result/
 __pycache__/
 .pytest_cache/
-.venv/
+.venv*/
 *.pyc
 *.zip
 *.pptx
 unsloth_compiled_cache/
-downloads/ZaloAIChallenge/
-downloads/*.log
-downloads/drive_listing.json
 docs/portal_*/

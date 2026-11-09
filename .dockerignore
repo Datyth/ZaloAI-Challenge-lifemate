@@ -1,0 +1,13 @@
+# Build context of docker/Dockerfile: code, the pinned base LLM and the published release checkpoints only.
+*
+!configs/
+!docker/
+!scripts/
+!src/
+!synth/
+!pyproject.toml
+!README.md
+!models/qwen3.5-4b/
+!outputs/release/
+**/__pycache__
+**/*.pyc

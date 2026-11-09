@@ -1,12 +1,16 @@
-# Every setting of the final run, in one place (the guide asks for fixed defaults; nothing is passed on the command line).
-# Base model, adapter and parser of the chosen agent (Qwen3.5-4B + LoRA: qwen3_coder parser, one merged system message, no thinking).
+# Every setting of the image (the guide asks for fixed defaults; nothing is passed on the command line).
+# Model and agent settings come from configs/release.sh, the file local serving and evaluation read too.
+source /code/configs/release.sh
 LLM_DIR=/code/models/llm_base
 LORA_DIR=/code/models/lora
-TOOL_PARSER=qwen3_coder
-export LIFEMATE_MERGE_SYSTEM=1
-export LIFEMATE_LLM_EXTRA='{"chat_template_kwargs": {"enable_thinking": false}}'
-export LIFEMATE_SERVED_MODEL=lifemate
+export LIFEMATE_SERVED_MODEL=$LORA_NAME
 export LIFEMATE_ASR_DIR=/code/models/gipformer
 export LIFEMATE_ASR_THREADS=8
-export LIFEMATE_DEADLINE=27
-VLLM_FLAGS=(--max-model-len 16384 --gpu-memory-utilization 0.85 --seed 42 --max-lora-rank 32 --max-num-seqs 4)   # prefix caching stays on: val50 single stream gave 0/50 rows differing with it, 2/50 without
+export LIFEMATE_DEADLINE=27      # seconds per sample, ASR included (limit 30)
+VLLM_FLAGS=("${VLLM_MODEL_FLAGS[@]}" "${VLLM_LORA_FLAGS[@]}" --gpu-memory-utilization 0.85 --max-num-seqs 4)
+
+# The vLLM server of predict.sh and predict_notebook.ipynb: loopback only (the container has no network), base model + LoRA.
+vllm_server() {
+  exec python3 -m vllm.entrypoints.openai.api_server --model "$LLM_DIR" --served-model-name base --host 127.0.0.1 --port 8000 \
+    --lora-modules "$LIFEMATE_SERVED_MODEL=$LORA_DIR" "${VLLM_FLAGS[@]}"
+}

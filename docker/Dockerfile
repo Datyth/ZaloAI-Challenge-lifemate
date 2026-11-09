@@ -1,7 +1,9 @@
 # LifeMate private-test image, laid out as the organizers' guide asks (Docker_Guide_ZAC2026_LifeMate.pdf):
 #   /code/predict.sh  /code/flags.sh  /code/README.md  /code/requirements.txt  /code/src/lifemate (inference code)
 #   /code/models/{llm_base,lora,gipformer}  /code/predict_notebook.ipynb  /code/start_jupyter.sh  /code/training_code
-# Build from the repo root (models/ and outputs/ present on the build machine):
+#   /code/configs/release.sh (model and agent settings shared with local runs; sourced by flags.sh)
+# Build from the repo root after scripts/setup/get_models.sh and get_checkpoint.sh (the weights are the published release, so the
+# image always matches the checkpoints scored locally; .dockerignore keeps data/ and every other output out of the context):
 #   docker build --platform linux/amd64 -f docker/Dockerfile -t zac2026_lifemate_<team>:v1 .
 # Scoring command (guide, section 10):
 #   docker run --rm --gpus '"device=0"' --network none -v /path/to/data:/data:ro -v /path/to/result:/result zac2026_lifemate_<team>:v1 bash /code/predict.sh
@@ -14,10 +16,17 @@ WORKDIR /code
 COPY docker/requirements.txt /code/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /code/requirements.txt
 # weights first, so a code change does not invalidate their layers
+# outputs/release/$RELEASE_NAME of configs/release.sh
+ARG RELEASE=outputs/release/lifemate-q35e1
 COPY models/qwen3.5-4b/ /code/models/llm_base/
-COPY outputs/sft/FINAL_ADAPTER/ /code/models/lora/
-COPY models/gipformer-lm-v2-01/ /code/models/gipformer/
-COPY build/training_code/ /code/training_code/
+COPY ${RELEASE}/llm-lora/ /code/models/lora/
+COPY ${RELEASE}/asr-gipformer-v2/ /code/models/gipformer/
+COPY pyproject.toml README.md /code/training_code/
+COPY configs/ /code/training_code/configs/
+COPY scripts/ /code/training_code/scripts/
+COPY synth/ /code/training_code/synth/
+COPY src/ /code/training_code/src/
+COPY configs/release.sh /code/configs/release.sh
 COPY docker/README.md docker/predict.sh docker/flags.sh docker/start_jupyter.sh docker/predict_notebook.ipynb /code/
 COPY src/lifemate /code/src/lifemate
 RUN chmod +x /code/predict.sh /code/start_jupyter.sh

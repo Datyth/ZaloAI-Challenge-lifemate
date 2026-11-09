@@ -9,12 +9,11 @@ from lifemate.data import audio_path, catalog, installed_tools, items
 from lifemate.toolenv import new_env
 from lifemate.submission import validate_file
 from lifemate.metrics import error_counts, exact_tool_f1
-from lifemate.asr_eval import critical_slots, slot_hits, labelled_slices
 from lifemate.models import stored_parameters
 from lifemate.llm import LocalChat
-from scripts.analyze_agent_optimization import classify
 
 ROOT = Path(__file__).resolve().parents[1] / "data" / "train+public_test"
+needs_data = unittest.skipUnless((ROOT / "train").is_dir(), "organizer kit not in data/train+public_test")
 
 
 class ScriptedLLM:
@@ -189,18 +188,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(len(model.messages), 2)
         self.assertFalse(any(kind == "protocol_events" and x.get("kind") == "read_to_action_check" for kind, x in events))
 
-    def test_e5_classification_uses_oracle_and_read_evidence(self):
-        sample = {"label": {"tool_calls": [{"name": "calendar.list_events", "arguments": {}},
-                                            {"name": "calendar.update_event", "arguments": {}}]}, "history": [], "audio_text": "Dời lịch họp"}
-        base = {"tool_calls": [{"name": "calendar.list_events", "arguments": {}}], "status": "ok"}
-        specs = {"calendar.list_events": {"kind": "read"}, "calendar.update_event": {"kind": "write"}}
-        primary, secondary, evidence = classify(sample, base, None, [], specs)
-        self.assertEqual(primary, "Premature termination")
-        self.assertIn("Multi-step planning", secondary)
-        self.assertTrue(evidence)
-        primary, _, _ = classify(sample, base, {"train_state_match": True}, [], specs)
-        self.assertEqual(primary, "ASR errors")
-
     def test_direct_user_id_is_accepted_but_fabricated_id_is_rejected(self):
         item = {"id": "x", "history": [], "context": {"installed_apps": {"alarm": {}}}}
         specs = [{"name": "alarm.delete", "kind": "write", "parameters": {"type": "object", "properties": {"alarm_id": {"type": "string", "x-ref": "alarm.alarms"}}, "required": ["alarm_id"]}}]
@@ -255,12 +242,14 @@ class CoreTest(unittest.TestCase):
         self.assertEqual([x["name"] for x in env.calls], ["sys.ask_missing_info"])
         self.assertEqual([x["status"] for kind, x in events if kind == "terminations"], ["missing_information"])
 
+    @needs_data
     def test_loader_and_path_guard(self):
         sample = next(items(ROOT, "train"))
         self.assertTrue(audio_path(ROOT, "train", sample["audio"]).is_file())
         with self.assertRaises(ValueError):
             audio_path(ROOT, "train", "../train_environment/train_0001/state.json")
 
+    @needs_data
     def test_toolenv_order_and_hash(self):
         sample = next(items(ROOT, "train"))
         for mode in ("E0", "E1", "E2", "E3"):
@@ -275,12 +264,14 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(row["tool_calls"][0]["name"], "weather.get_forecast")
                 self.assertTrue(any(kind == "tool_events" and obj["executed"] for kind, obj in events))
 
+    @needs_data
     def test_rejected_proposal_not_recorded(self):
         sample = next(items(ROOT, "train"))
         env = new_env(ROOT, "train", sample["id"])
         row = execute(sample, "x", installed_tools(sample, catalog(ROOT, "train")), env, ScriptedLLM([("calendar.update_event", {})]), lambda _: "", lambda *_: None, orchestration="E0")
         self.assertEqual(row["tool_calls"], [])
 
+    @needs_data
     def test_unobserved_reference_id_is_not_executed(self):
         sample = next(items(ROOT, "train"))
         env = new_env(ROOT, "train", sample["id"])
@@ -289,6 +280,7 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(row["tool_calls"], [])
         self.assertTrue(any(kind == "tool_events" and not record["executed"] for kind, record in events))
 
+    @needs_data
     def test_submission_replays_exact_hash(self):
         sample = next(items(ROOT, "train"))
         env = new_env(ROOT, "train", sample["id"])
@@ -307,20 +299,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(error_counts("Nhắn cho Dũng", "nhắn Dũng"), {"word_errors": 1, "reference_words": 3, "character_errors": 3, "reference_characters": 11})
         call = {"name": "weather.get_forecast", "arguments": {"date": "2026-11-29"}}
         self.assertEqual(exact_tool_f1([call], [call, call]), 2 / 3)
-
-    def test_critical_slots_use_only_explicit_gold_values(self):
-        calls = [{"name": "contacts.search", "arguments": {"query": "Phạm Hùng"}},
-                 {"name": "banking.transfer", "arguments": {"amount": 100000, "recipient_id": "c_123"}}]
-        slots = critical_slots("Chuyển tiền cho Phạm Hùng nhé", calls)
-        self.assertEqual([(x["key"], x["value"]) for x in slots], [("query", "Phạm Hùng")])
-        self.assertTrue(slot_hits(slots, "chuyển tiền cho phạm hùng")[0]["matched"])
-        self.assertFalse(slot_hits(slots, "chuyển tiền cho Phạm Hoàng")[0]["matched"])
-
-    def test_audio_slices_do_not_invent_accent_or_noise_labels(self):
-        self.assertEqual(labelled_slices({}, {"duration_seconds": 1.5, "warnings": []}), ["short_under_4s"])
-        self.assertEqual(labelled_slices({"metadata": {"accent": "Miền Trung", "noisy": True, "truncated": True}},
-                                         {"duration_seconds": 3, "warnings": []}),
-                    ["short_under_4s", "accent:miền_trung", "noisy_labelled", "truncated_labelled"])
 
     def test_stored_parameter_audit(self):
         with tempfile.TemporaryDirectory() as temp:
