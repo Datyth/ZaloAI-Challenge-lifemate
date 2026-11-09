@@ -1,59 +1,12 @@
-"""Offline ASR adapters using only locally downloaded checkpoints."""
+"""Gipformer RNN-T ASR (sherpa-onnx, modified beam search) from a local ONNX checkpoint."""
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Protocol
-
-
-class ASRBackend(Protocol):
-    def transcribe(self, path: Path) -> str: ...
-
-
-class QwenASR:
-    def __init__(self, model_dir: Path, device: str = "cuda:0") -> None:
-        if not (model_dir / "config.json").is_file():
-            raise FileNotFoundError(f"ASR checkpoint missing: {model_dir}; run download first")
-        try:
-            import torch
-            from qwen_asr import Qwen3ASRModel
-        except ImportError as exc:
-            raise RuntimeError("Install the official qwen-asr package in a compatible Python environment") from exc
-        dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
-        self.model = Qwen3ASRModel.from_pretrained(
-            str(model_dir), dtype=dtype, device_map=device, max_new_tokens=256
-        )
-
-    def transcribe(self, path: Path) -> str:
-        results = self.model.transcribe(audio=str(path), language="Vietnamese")
-        return str(results[0].text)
-
-
-class ChunkFormerASR:
-    def __init__(self, model_dir: Path, device: str = "cuda:2") -> None:
-        for name in ("config.yaml", "global_cmvn", "pytorch_model.pt", "vocab.txt"):
-            if not (model_dir / name).is_file():
-                raise FileNotFoundError(f"ChunkFormer checkpoint missing {name}: {model_dir}")
-        try:
-            from chunkformer import ChunkFormerModel
-        except ImportError as exc:
-            raise RuntimeError("Install chunkformer==1.2.2 and its inference imports") from exc
-        self.model = ChunkFormerModel.from_pretrained(str(model_dir)).to(device).eval()
-
-    def transcribe(self, path: Path) -> str:
-        # The upstream API returns plain text when timestamps are disabled.
-        result = self.model.endless_decode(
-            audio_path=str(path), chunk_size=64, left_context_size=128,
-            right_context_size=128, total_batch_duration=1800,
-            return_timestamps=False,
-        )
-        if not isinstance(result, str):
-            raise TypeError(f"unexpected ChunkFormer decode result: {type(result).__name__}")
-        return result.strip()
 
 
 class GipformerASR:
-    def __init__(self, model_dir: Path, device: str = "cuda:2") -> None:
+    def __init__(self, model_dir: Path, device: str = "cpu") -> None:
         for name in ("encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"):
             if not (model_dir / name).is_file():
                 raise FileNotFoundError(f"Gipformer checkpoint missing {name}: {model_dir}")
@@ -92,13 +45,3 @@ class GipformerASR:
         stream.accept_waveform(rate, samples)
         self.recognizer.decode_streams([stream])
         return stream.result.text.strip()
-
-
-def load_asr(name: str, model_dir: Path, device: str) -> ASRBackend:
-    if name == "qwen":
-        return QwenASR(model_dir, device=device)
-    if name == "chunkformer":
-        return ChunkFormerASR(model_dir, device=device)
-    if name == "gipformer":
-        return GipformerASR(model_dir, device=device)
-    raise ValueError(f"unknown ASR model: {name}")

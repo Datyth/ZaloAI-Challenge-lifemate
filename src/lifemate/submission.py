@@ -9,6 +9,15 @@ from .data import items
 from .toolenv import new_env
 
 
+def shard_dirs(prefix: Path) -> list[Path]:
+    """Run directories of a run prefix: <prefix> itself, else its shards <prefix>_s0, _s1, ... (written by run_shards.sh).
+    Only exact shard names match, so prefix `pub` never picks up the shards of `pub_synth`."""
+    if prefix.is_dir():
+        return [prefix]
+    shard = re.compile(re.escape(prefix.name) + r"_s\d+")
+    return sorted((d for d in prefix.parent.glob(prefix.name + "_s*") if shard.fullmatch(d.name)), key=lambda d: int(d.name.rsplit("_s", 1)[1]))
+
+
 def validate_file(root: Path, split: str, path: Path, allow_partial: bool = False) -> dict:
     expected = [item["id"] for item in items(root, split)]
     with path.open(encoding="utf-8") as source:

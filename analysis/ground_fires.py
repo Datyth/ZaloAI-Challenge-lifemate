@@ -15,6 +15,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 from lifemate.agent import _drop_context_defaults, _unreferenced_ids, _user_supplied_id  # noqa: E402
 from lifemate.history import ids_in, successful  # noqa: E402
+from lifemate.submission import shard_dirs  # noqa: E402
 
 ROOT = PROJECT / "data/train+public_test"
 
@@ -29,7 +30,7 @@ def main() -> None:
     raw = json.loads((ROOT / a.split / f"{a.split}_tools_catalog.json").read_text(encoding="utf-8"))
     specs = {t["name"]: t for app in raw["apps"] for t in app["tools"]}
     events, speech = defaultdict(list), defaultdict(list)
-    for d in sorted((PROJECT / "outputs/runs").glob(a.prefix + "_s*")):
+    for d in shard_dirs(PROJECT / "outputs/runs" / a.prefix):
         for e in map(json.loads, (d / "tool_events.jsonl").open(encoding="utf-8")):
             if e.get("executed"):
                 events[e["sample_id"]].append(e)

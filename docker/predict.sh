@@ -8,9 +8,7 @@ cd /code
 source ./flags.sh
 mkdir -p /result/logs
 t0=$(date +%s)
-python3 -m vllm.entrypoints.openai.api_server --model "$LLM_DIR" --served-model-name base --host 127.0.0.1 --port 8000 \
-  --language-model-only --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" \
-  --enable-lora --lora-modules "$LIFEMATE_SERVED_MODEL=$LORA_DIR" "${VLLM_FLAGS[@]}" > /result/logs/vllm.log 2>&1 &
+vllm_server > /result/logs/vllm.log 2>&1 &
 server=$!
 until curl -fsS http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
   kill -0 $server 2>/dev/null || { echo "vLLM failed to start, see /result/logs/vllm.log"; tail -20 /result/logs/vllm.log; exit 1; }

@@ -5,7 +5,7 @@ the hash of replaying the gold calls), and the score is the F1 of a one-to-one m
 name, equal non-fuzzy arguments (strings lower-cased, whitespace collapsed, number+unit joined, scalar lists as sets) and, for
 x-match: fuzzy arguments, token F1 >= --fuzzy (on zaic_tools' accent-folded tokens). The score is the mean x 100.
   python analysis/score.py outputs/runs/v200_sft_oracle [more run prefixes...]
-A prefix matches outputs/runs/<prefix> and its shards <prefix>_s*."""
+A prefix matches outputs/runs/<prefix> and its shards <prefix>_s<k>."""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +19,7 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parents[1]
 ROOT = PROJECT / "data/train+public_test"
 sys.path.insert(0, str(PROJECT / "src"))
+from lifemate.submission import shard_dirs  # noqa: E402
 from lifemate.toolenv import new_env  # noqa: E402
 
 GOLD_HASH = PROJECT / "outputs/analysis/gold_hash_train.json"
@@ -117,7 +118,7 @@ def gold_hashes(items: list[dict]) -> dict[str, str]:
 
 
 def load_run(prefix: Path) -> dict[str, dict]:
-    dirs = [prefix] if (prefix / "predictions.jsonl").is_file() else sorted(prefix.parent.glob(prefix.name + "_s*"))
+    dirs = shard_dirs(prefix)
     rows = {}
     for d in dirs:
         for line in (d / "predictions.jsonl").open(encoding="utf-8"):

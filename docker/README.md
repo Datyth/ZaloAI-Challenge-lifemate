@@ -1,7 +1,6 @@
 # LifeMate solution (Zalo AI Challenge 2026, Track 1)
 
-> Draft (2026-11-08). The base model and the adapter are fixed after the last public comparisons. The numbers marked TBD are
-> filled from the final runs.
+> Release `lifemate-q35e1` (public 58.02, 2026-11-08). The numbers marked TBD still need a measurement.
 
 ## Run
 
@@ -9,7 +8,7 @@
 bash /code/predict.sh        # no arguments: reads /data/<split>, writes /result/submission.jsonl
 ```
 
-All settings are fixed in `/code/flags.sh`.
+All settings are fixed in `/code/flags.sh`, which sources `/code/configs/release.sh`; local evaluation uses the same file.
 
 - `predict.sh` starts a local vLLM server (loopback only) with the base model and the LoRA adapter.
 - It then runs the samples one at a time with `python3 -m lifemate.docker_predict`.
@@ -43,19 +42,26 @@ All settings are fixed in `/code/flags.sh`.
 
 | Model | Source | Release | Parameters |
 | --- | --- | --- | ---: |
-| Base LLM, text layers only | TBD (Qwen3.5-4B or Qwen3-4B-Instruct-2507) | before 2026-10-26 | TBD |
-| LoRA adapter (ours) | QLoRA r16 on TRAIN trajectories and synthetic apps, see `training_code/` | 2026-11 | TBD |
+| Base LLM, text layers only (`--language-model-only`) | Qwen/Qwen3.5-4B @ 851bf6e8, Apache-2.0 | 2026-02-27 | TBD (4.66B with the vision tower) |
+| LoRA adapter `q35_e1` (ours) | QLoRA r16 on TRAIN trajectories (gold and ASR transcripts), see `training_code/` | 2026-11 | TBD |
 | ASR | g-group-ai-lab/gipformer1.5-68M-rnnt, fine-tuned by us | 2026-08-21 | 69,650,000 |
 | **Total** | | | **TBD (< 6B; LLM < 5B; context 16,384)** |
 
 ## Data
 
 - **Real data.** Only the TRAIN split. Public and private test were never labelled or used for training.
-- **Synthetic data**, as the rules allow during development:
+- **Synthetic data.** The released adapter does not use it: an adapter trained with it scored 56.69 on public, against 58.02.
+  The generator ships in `training_code/synth/`, as the rules allow during development:
   - new apps written for training only, as zaic_tools-style modules with catalog schemas (`training_code/synth/`);
   - tasks whose gold calls are replayed with the official `Session`;
   - distractor apps and user profiles from TRAIN samples, read through `ToolEnv.get_state()`.
   - None of the synthetic apps copies a TRAIN or PUBLIC app.
+
+## Training code
+
+`/code/training_code/` is a copy of the repository code: `README.md` (setup, train, eval), `pyproject.toml`, `configs/`,
+`scripts/{setup,data,train,infer}/`, `synth/` and `src/`. The data is the organizer's TRAIN split. The frozen validation ids
+are in `configs/splits/validation_ids.json`.
 
 ## Reproducibility and time
 
