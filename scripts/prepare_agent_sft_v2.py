@@ -112,7 +112,7 @@ def trajectory(item: dict, root: Path, specs: dict, transcripts: dict[str, str],
     structured, _ = structured_history(item["history"], lambda a: transcripts[a], {s["name"]: s.get("kind", "unknown") for s in available})
     messages = [{"role": "system", "content": prompt_for(orchestration)},
                 {"role": "system", "content": GUIDANCE + "\n" + json.dumps(structured, ensure_ascii=False)},
-                user_message(item, transcripts[item["audio"]], orchestration)]
+                user_message(item, transcripts[item["audio"]], orchestration, available)]
     env = new_env(root, split, item["id"])
     gold = item["label"]["tool_calls"]
     for k, call in enumerate(gold):
@@ -134,6 +134,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", type=Path, default=PROJECT / "data/train+public_test")
     ap.add_argument("--validation-ids", type=Path, default=PROJECT / "outputs/splits/validation_ids.json")
+    ap.add_argument("--include-validation", action="store_true", help="final training: do not exclude the 200 validation tasks")
     ap.add_argument("--asr-cache", type=Path, default=PROJECT / "outputs/asr/gipformer_train/asr_outputs.jsonl")
     ap.add_argument("--orchestration", default="S2")
     ap.add_argument("--variants", default="gold,asr")
@@ -146,7 +147,9 @@ def main() -> None:
     a = ap.parse_args()
     root = a.data_root
     forbidden = set(json.loads(a.validation_ids.read_text()))
-    if len(forbidden) != 200:
+    if a.include_validation:          # final training: the 200 validation tasks are trained too (no held-out val left)
+        forbidden = set()
+    elif len(forbidden) != 200:
         raise ValueError("validation split must contain exactly 200 unique TRAIN IDs")
     held = {x for x in a.exclude_apps.split(",") if x}
     specs = catalog(root, a.split)

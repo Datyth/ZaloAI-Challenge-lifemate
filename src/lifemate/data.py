@@ -27,7 +27,9 @@ def audio_path(root: Path, split: str, relative: str) -> Path:
 def catalog(root: Path, split: str) -> dict[str, dict]:
     path = root / split / f"{split}_tools_catalog.json"
     raw = json.loads(path.read_text(encoding="utf-8"))
-    return {t["name"]: t for app in raw["apps"] for t in app["tools"]}
+    # "_app": the app's Vietnamese name and description (users name apps that way: "app đi chợ"); read by agent.user_message (E1P)
+    return {t["name"]: {**t, "_app": {"id": app["id"], "name": app.get("name_vi", ""), "description": app.get("description", "")}}
+            for app in raw["apps"] for t in app["tools"]}
 
 
 def installed_tools(item: dict, specs: dict[str, dict]) -> list[dict]:

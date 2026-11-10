@@ -41,7 +41,12 @@ class Predictor:
         self.split = find_split(self.root)
         self.specs = catalog(self.root, self.split)
         self.asr = GipformerASR(asr_dir, device="cpu")
-        self.llm = LocalChat(llm_url, model, timeout=deadline)
+        ensemble = os.environ.get("LIFEMATE_ENSEMBLE", "").strip()
+        if ensemble:   # step-level vote of several served LoRAs on the one ToolEnv (lifemate.ensemble); first member breaks ties
+            from .ensemble import EnsembleChat
+            self.llm = EnsembleChat(llm_url, [tuple(m.split(":", 1)) for m in ensemble.split(",")], timeout=deadline)
+        else:
+            self.llm = LocalChat(llm_url, model, timeout=deadline)
         self.deadline, self.max_turns = deadline, max_turns
 
     def samples(self) -> list[dict]:
@@ -61,8 +66,12 @@ class Predictor:
         try:
             transcript = transcribe(item["audio"])
             view = {key: item[key] for key in ("id", "audio", "context", "history")}
+            if hasattr(self.llm, "bind"):
+                self.llm.bind(view, transcript, installed_tools(view, self.specs))
+                self.llm.last_votes = []
             execute(view, transcript, installed_tools(view, self.specs), env, self.llm, transcribe, log, max_turns=self.max_turns,
-                    deadline_seconds=self.deadline - (time.perf_counter() - t1), orchestration="E1", dedup_calls=True)
+                    deadline_seconds=self.deadline - (time.perf_counter() - t1), orchestration=os.environ.get("LIFEMATE_ORCHESTRATION", "E1"), dedup_calls=True,
+                    retry_cap=int(os.environ.get("LIFEMATE_RETRY_CAP", "0")))
         except Exception as exc:  # the line is still written from the ToolEnv
             log("error", {"sample_id": item["id"], "error": f"{type(exc).__name__}: {exc}"})
         return {"id": item["id"], "tool_calls": env.get_tool_calls(), "state_hash": env.get_state_hash(), "time": int((time.perf_counter() - t1) * 1000)}
