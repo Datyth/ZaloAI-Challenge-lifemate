@@ -1,5 +1,5 @@
 """Tasks: pet_care, laundry, salon, wifi_router, smart_garden. Time anchor Thursday 2026-11-12 unless stated."""
-from _common import ASK, C, CONTACTS, REMINDERS, SMS, T
+from _common import ASK, C, CONTACTS, SMS, T
 
 NOW = "2026-11-12T09:00:00+07:00"
 EVE = "2026-11-12T19:30:00+07:00"

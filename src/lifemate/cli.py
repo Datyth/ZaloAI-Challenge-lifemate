@@ -126,7 +126,11 @@ def run(args: argparse.Namespace) -> None:
     if not args.device.startswith("cuda:") or int(args.device.split(":", 1)[1]) >= torch.cuda.device_count():
         raise RuntimeError(f"Requested GPU {args.device} is unavailable; detected {torch.cuda.device_count()} CUDA devices")
     asr = GipformerASR(args.asr_dir, device="cpu") if args.transcript_source == "asr" else None  # as in the Docker image
-    llm = LocalChat(args.llm_url, args.llm_served_model or str(args.llm_dir), timeout=args.deadline)
+    if args.ensemble:   # step-level vote of several served LoRAs on the one ToolEnv (lifemate.ensemble)
+        from .ensemble import EnsembleChat
+        llm = EnsembleChat(args.llm_url, [tuple(m.split(":", 1)) for m in args.ensemble.split(",")], timeout=args.deadline)
+    else:
+        llm = LocalChat(args.llm_url, args.llm_served_model or str(args.llm_dir), timeout=args.deadline)
     stamp = time.strftime("%Y%m%dT%H%M%S")
     run_id = args.run_id or f"{stamp}_{args.command}_{time.time_ns() % 1000000:06d}"
     run_dir = PROJECT / "outputs" / "runs" / run_id
@@ -145,7 +149,7 @@ def run(args: argparse.Namespace) -> None:
         path = directory / "lifemate_manifest.json"
         return json.loads(path.read_text()) if path.is_file() else None
     use_asr = args.transcript_source in {"asr", "cached-asr"}
-    config = {"split": split, "sample_ids": [x["id"] for x in selected], "seed": 42, "git_sha": git_sha, "kit_version": (root / "VERSION").read_text(), "versions": versions, "asr_model": str(args.asr_dir) if use_asr else None, "asr_manifest": manifest(args.asr_dir) if use_asr else None, "transcript_source": args.transcript_source, "transcripts_jsonl": str(args.transcripts_jsonl.resolve()) if args.transcripts_jsonl else None, "llm_model": str(args.llm_dir), "llm_manifest": manifest(args.llm_dir), "llm_served_model": args.llm_served_model or str(args.llm_dir), "adapter_dir": str(args.adapter_dir) if args.adapter_dir else None, "adapter_config_sha256": hashlib.sha256((args.adapter_dir / "adapter_config.json").read_bytes()).hexdigest() if args.adapter_dir else None, "adapter_weights_sha256": hashlib.sha256((args.adapter_dir / "adapter_model.safetensors").read_bytes()).hexdigest() if args.adapter_dir else None, "device": args.device, "gpu_name": torch.cuda.get_device_name(int(args.device.split(":", 1)[1])), "prompt_sha256": hashlib.sha256(prompt_for(args.orchestration).encode()).hexdigest(), "orchestration": args.orchestration, "decoding": {"temperature": 0, "seed": 42, "max_tokens": 512}, "deadline_seconds": args.deadline, "max_turns": args.max_turns, "asr_lowercase": args.asr_lowercase, "dedup_calls": args.dedup_calls, "ground_args": args.ground_args}
+    config = {"split": split, "sample_ids": [x["id"] for x in selected], "seed": 42, "git_sha": git_sha, "kit_version": (root / "VERSION").read_text(), "versions": versions, "asr_model": str(args.asr_dir) if use_asr else None, "asr_manifest": manifest(args.asr_dir) if use_asr else None, "transcript_source": args.transcript_source, "transcripts_jsonl": str(args.transcripts_jsonl.resolve()) if args.transcripts_jsonl else None, "llm_model": str(args.llm_dir), "llm_manifest": manifest(args.llm_dir), "llm_served_model": args.llm_served_model or str(args.llm_dir), "adapter_dir": str(args.adapter_dir) if args.adapter_dir else None, "adapter_config_sha256": hashlib.sha256((args.adapter_dir / "adapter_config.json").read_bytes()).hexdigest() if args.adapter_dir else None, "adapter_weights_sha256": hashlib.sha256((args.adapter_dir / "adapter_model.safetensors").read_bytes()).hexdigest() if args.adapter_dir else None, "device": args.device, "gpu_name": torch.cuda.get_device_name(int(args.device.split(":", 1)[1])), "prompt_sha256": hashlib.sha256(prompt_for(args.orchestration).encode()).hexdigest(), "orchestration": args.orchestration, "decoding": {"temperature": 0, "seed": 42, "max_tokens": 512}, "deadline_seconds": args.deadline, "max_turns": args.max_turns, "asr_lowercase": args.asr_lowercase, "dedup_calls": args.dedup_calls, "retry_cap": args.retry_cap, "ensemble": args.ensemble}
     (run_dir / "run_config.json").write_text(json.dumps(config, ensure_ascii=False, indent=2))
     (run_dir / "runtime_errors.jsonl").touch()
     specs = catalog(root, split)
@@ -204,7 +208,12 @@ def run(args: argparse.Namespace) -> None:
                 inference_item = {key: item[key] for key in ("id", "audio", "context", "history")}
                 allowed_history_keys = {"role", "audio", "text", "tool_calls", "tool_results"}
                 inference_item["history"] = [{key: value for key, value in turn.items() if key in allowed_history_keys} for turn in item["history"]]
-                result = execute(inference_item, transcript, installed_tools(inference_item, specs), env, llm, transcribe, log, max_turns=args.max_turns, deadline_seconds=remaining, orchestration=args.orchestration, dedup_calls=args.dedup_calls, ground_args=args.ground_args)
+                if args.ensemble:
+                    llm.bind(inference_item, transcript, installed_tools(inference_item, specs))
+                    llm.last_votes = []
+                result = execute(inference_item, transcript, installed_tools(inference_item, specs), env, llm, transcribe, log, max_turns=args.max_turns, deadline_seconds=remaining, orchestration=args.orchestration, dedup_calls=args.dedup_calls, retry_cap=args.retry_cap)
+                if args.ensemble:
+                    log("ensemble_votes", {"sample_id": item["id"], "votes": llm.last_votes})
                 if result["tool_calls"] != env.get_tool_calls() or result["state_hash"] != env.get_state_hash():
                     raise AssertionError("submission row diverged from ToolEnv")
                 elapsed = time.monotonic() - started + cached_asr_seconds
@@ -297,10 +306,11 @@ def main() -> None:
         p.add_argument("--transcript-source", choices=["asr", "cached-asr", "train-reference"], default="asr")
         p.add_argument("--transcripts-jsonl", type=Path)
         p.add_argument("--allow-failures", action="store_true", help="keep replay-valid rows and error logs for individual failures")
-        p.add_argument("--orchestration", choices=["E0", "E1", "E2", "E3", "E6", "O1", "O2", "O3", "O4", "O5", "S2"], default="E1")
+        p.add_argument("--orchestration", choices=["E1", "E1D", "E1P"], default="E1P")
+        p.add_argument("--ensemble", help="served:orchestration,... step-level vote of several LoRAs on the one ToolEnv; first = tie-break")
+        p.add_argument("--retry-cap", type=int, default=0, help="block a read tool after it returned empty/not-found this many times (0 = off)")
         p.add_argument("--asr-lowercase", action="store_true", help="lower-case every ASR transcript (current and history) before the agent")
         p.add_argument("--dedup-calls", action="store_true", help="never execute an identical (name, arguments) call twice in a sample; stop after three repeats")
-        p.add_argument("--ground-args", action="store_true", help="writes: reject ID arguments without x-ref that no tool result, history, context or speech contains; drop optional arguments that only copy an unmentioned context value")
     trace = sub.add_parser("trace")
     trace.add_argument("--sample-id", required=True)
     trace.add_argument("--run-dir", type=Path, required=True)

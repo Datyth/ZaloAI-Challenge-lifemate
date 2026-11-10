@@ -1,69 +1,103 @@
 # LifeMate solution (Zalo AI Challenge 2026, Track 1)
 
-> Release `lifemate-q35e1` (public 58.02, 2026-11-08). The numbers marked TBD still need a measurement.
+Release `lifemate-final` (public test **61.26**, 2026-11-09). A spoken Vietnamese request becomes tool calls on the sample's
+single `ToolEnv`: Gipformer ASR on CPU, then a Qwen3.5-4B agent with a LoRA adapter, served by a local vLLM.
 
 ## Run
 
 ```bash
 bash /code/predict.sh        # no arguments: reads /data/<split>, writes /result/submission.jsonl
+bash /code/start_jupyter.sh  # JupyterLab on port 9777 (password zac2026) for predict_notebook.ipynb
 ```
 
-All settings are fixed in `/code/flags.sh`, which sources `/code/configs/release.sh`; local evaluation uses the same file.
+Every setting is fixed in `/code/flags.sh`, which sources `/code/configs/release.sh` (the file local evaluation uses too).
 
-- `predict.sh` starts a local vLLM server (loopback only) with the base model and the LoRA adapter.
-- It then runs the samples one at a time with `python3 -m lifemate.docker_predict`.
-- `predict_notebook.ipynb` runs the same code cell by cell (seed, load, read, predict) and writes `/result/jupyter_submission.jsonl`.
-- `start_jupyter.sh` opens JupyterLab on port 9777 (password `zac2026`).
+1. `predict.sh` starts a vLLM server on 127.0.0.1:8000 (loopback only; the container needs no network) with the base model and
+   the LoRA adapter, and prints the model load time.
+2. It runs the samples one at a time, in file order, with `python3 -m lifemate.docker_predict`, and prints the mean and
+   maximum time per sample.
+3. `predict_notebook.ipynb` runs the same code cell by cell (seed, load, read, predict) and writes
+   `/result/jupyter_submission.jsonl` with the same rows.
 
 | Output | Content |
 | --- | --- |
-| `/result/submission.jsonl` | One line per sample: `id`, `tool_calls` (`env.get_tool_calls()`), `state_hash` (`env.get_state_hash()`), `time` in ms from before the audio is read. Flushed after every sample |
-| `/result/logs/trace.jsonl` | Every LLM turn, proposed and executed call, and termination of every sample |
-| `/result/logs/vllm.log` | vLLM server log (model load time) |
+| `/result/submission.jsonl` | One line per sample: `id`, `tool_calls` (`env.get_tool_calls()`), `state_hash` (`env.get_state_hash()`), `time` in ms measured from before the audio is read. Written and flushed after every sample |
+| `/result/logs/trace.jsonl` | Every LLM turn, every proposed and executed call, and how each sample ended |
+| `/result/logs/vllm.log` | vLLM server log |
+
+`zaic_tools` is imported from `/data/<split>` (never from a copy in the image), and app data is read and changed only through
+`ToolEnv` (one per sample, created once). A sample whose agent loop fails still gets its line: the calls already made on its
+ToolEnv and that state's hash.
 
 ## Pipeline
 
-1. **ASR.**
-   - Model: Gipformer 1.5 (68M RNN-T, g-group-ai-lab) fine-tuned on the TRAIN audio, exported to ONNX.
-   - Runs on CPU with sherpa-onnx: modified beam search, 8 threads, about 0.07 s per file. The output is identical to the GPU run.
+1. **ASR.** Gipformer 1.5 (68M RNN-T, g-group-ai-lab), fine-tuned by us on all TRAIN recordings and exported to ONNX.
+   - sherpa-onnx on CPU, modified beam search, 8 threads, about 0.07 s per recording (same text as on GPU).
    - The current request and every user turn of the history are transcribed, then lower-cased.
-2. **Agent.**
-   - The LLM sees one system prompt with the rules and the read-only history (previous requests, prior verified tool calls and
-     results, known entities), the request with the context, and the JSON schemas of the installed tools.
-   - It calls tools one at a time through the sample's single `ToolEnv`. Every result goes back to the model.
-   - The loop stops on a reply without tool calls, after 10 turns, or at the per-sample deadline (27 s).
-   - Guards, all generic (no app is named):
-     - a call that fails the schema is shown to the model as an error and not executed;
-     - an identical call is never executed twice;
-     - `x-ref` IDs must come from an earlier result or the history.
-3. **Output.** The submission line is exactly `env.get_tool_calls()` and `env.get_state_hash()`.
+2. **Prompt.** One system message with the rules (when to act, ask back with `sys.ask_missing_info`, or stop), the read-only
+   history (earlier requests, the calls already made and their results), the context (time, place, user profile, a weekday
+   calendar of the coming days, the Vietnamese name and description of every installed app), the request, and the JSON schemas
+   of the installed tools.
+3. **Agent loop.** At most 10 turns; each turn the LLM proposes one tool call (non-thinking, greedy). Before it reaches
+   `env.call`, the call must pass three generic checks (no app is named in them):
+   - it validates against the schema (`env.validate`) and every `x-ref` ID comes from an earlier result, the history or the
+     context; otherwise the error goes back to the model and nothing is executed;
+   - an identical call is never executed twice;
+   - a read tool that came back empty twice is blocked (the model is told to ask back or move on).
+
+   The result of an executed call goes back to the model. The loop ends when the model replies without a call, after 10 turns,
+   or at the 27 s deadline of the sample (ASR included).
+4. **Output.** The line is exactly `env.get_tool_calls()` and `env.get_state_hash()`.
+
+Optional, off in this release: a step-level vote of the three adapters in `/code/models/` (`ENSEMBLE` in
+`/code/configs/release.sh`). Each turn all three propose a call and only the majority call runs, on the same single ToolEnv.
 
 ## Models
 
-| Model | Source | Release | Parameters |
+| Model | Source | Released | Parameters |
 | --- | --- | --- | ---: |
-| Base LLM, text layers only (`--language-model-only`) | Qwen/Qwen3.5-4B @ 851bf6e8, Apache-2.0 | 2026-02-27 | TBD (4.66B with the vision tower) |
-| LoRA adapter `q35_e1` (ours) | QLoRA r16 on TRAIN trajectories (gold and ASR transcripts), see `training_code/` | 2026-11 | TBD |
-| ASR | g-group-ai-lab/gipformer1.5-68M-rnnt, fine-tuned by us | 2026-08-21 | 69,650,000 |
-| **Total** | | | **TBD (< 6B; LLM < 5B; context 16,384)** |
+| Base LLM, text layers (`--language-model-only`) | Qwen/Qwen3.5-4B @ 851bf6e8, Apache-2.0 | 2026-02 | 4,205,751,296 |
+| LoRA adapter `llm-lora-p1` (served) | ours: r16, alpha 32 on attention and MLP of the text layers | 2026-11 | 32,464,896 |
+| LoRA adapters `llm-lora-e1`, `llm-lora-synth` (only used by the optional vote) | ours, same shape | 2026-11 | 2 x 32,464,896 |
+| ASR `asr-gipformer` | g-group-ai-lab/gipformer1.5-68M-rnnt, fine-tuned by us | 2026-08 | 69,650,000 |
+| **Total loaded** | | | **4.31B (LLM 4.24B < 5B; with all three adapters 4.37B < 6B)** |
 
-## Data
+LLM context: 16,384 tokens (`--max-model-len 16384`). The image holds the base LLM because the LoRA adapters run on top of it at
+inference; the vision tower in the checkpoint is not loaded.
 
-- **Real data.** Only the TRAIN split. Public and private test were never labelled or used for training.
-- **Synthetic data.** The released adapter does not use it: an adapter trained with it scored 56.69 on public, against 58.02.
-  The generator ships in `training_code/synth/`, as the rules allow during development:
-  - new apps written for training only, as zaic_tools-style modules with catalog schemas (`training_code/synth/`);
-  - tasks whose gold calls are replayed with the official `Session`;
-  - distractor apps and user profiles from TRAIN samples, read through `ToolEnv.get_state()`.
-  - None of the synthetic apps copies a TRAIN or PUBLIC app.
+## Data and training
 
-## Training code
+- **Real data.** Only the organizer's TRAIN split (1,545 samples). The public and private test sets were never labelled or
+  used for training, and no rule or prompt names an app that only appears in the test sets.
+- **ASR.** All 5,036 TRAIN recordings (current requests and history turns). Number labels are written the way they are spoken
+  ("2.500.000" as "hai triệu rưỡi"); speed, noise and SpecAugment augmentation; 3 epochs, lr 2e-5.
+- **LLM (`llm-lora-p1`).** Every TRAIN sample becomes a chat trajectory: its gold calls are replayed in `ToolEnv` and must give
+  the labelled results. Each sample appears twice, with the gold transcript and with the original Gipformer's transcript (real
+  recognition errors on audio that ASR never trained on). 92 "recovery" trajectories add a failed search before the right one;
+  the failed call carries no loss, so the model learns the recovery, not the mistake. Loss only on the model's own turns (calls,
+  IDs, the decision to stop); free-text message fields (scored loosely by the metric) have weight 0.3. LoRA r16, 2 epochs,
+  lr 1e-4, max length 16,384, seed 42.
+- **Synthetic data (`llm-lora-synth` only).** Apps written by us for training (`training_code/synth/`), with tasks whose gold
+  calls are replayed with the official engine. None copies a TRAIN or test app. The served adapter does not use them.
 
-`/code/training_code/` is a copy of the repository code: `README.md` (setup, train, eval), `pyproject.toml`, `configs/`,
-`scripts/{setup,data,train,infer}/`, `synth/` and `src/`. The data is the organizer's TRAIN split. The frozen validation ids
-are in `configs/splits/validation_ids.json`.
+`/code/training_code/` is the repository code: its `README.md` gives the commands that rebuild the data
+(`scripts/data/build_final_data.sh`) and retrain every checkpoint (`scripts/train/train_final.sh`), and the URLs of the base
+models and of the released checkpoints (Hugging Face `hugebenevolence/lifemate-final`, frozen after the Docker deadline).
 
 ## Reproducibility and time
 
-- **Decoding and seeds.** Greedy decoding (temperature 0, seed 42), one sample at a time. Two single-stream runs of 50 val samples gave identical rows with prefix caching on (0/50 differ) and 2/50 differing with it off, so it stays on.
-- **Measured time.** Single-stream mean about 3 s and maximum about 10 s per sample on an RTX PRO 4000 Blackwell. A30: TBD.
+- Greedy decoding (temperature 0, vLLM seed 42), one sample at a time; seed 42 in the notebook, training and data scripts.
+- Prefix caching stays on: two single-stream runs of 50 validation samples differed on 0 rows with it and 2 without.
+- Time per sample with this exact code path on the 634 public-test samples, one RTX PRO 4000 Blackwell (24 GB), single stream:
+
+| 634 public samples, one stream, one RTX PRO 4000 Blackwell (24 GB) | Value |
+| --- | ---: |
+| Model loading (vLLM start to ready) | about 45 s |
+| Mean time per sample, ASR included | 2.88 s |
+| Slowest sample | 8.71 s |
+| Samples over the 30 s limit | 0 |
+| Same final state as the submitted 61.26 file | 618 / 634 |
+
+Greedy decoding is not bit-exact across runs in vLLM: batching (the 61.26 file used four parallel streams) and prefix-cache state
+change a few low-margin choices. Two single-stream runs of the same 100 public samples agreed on 97; in the 3 others the model got
+the identical prompt and picked a different amount at one turn. The Track 1 rules average five organizer runs in that case.

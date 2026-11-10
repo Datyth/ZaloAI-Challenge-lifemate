@@ -1,10 +1,11 @@
 # LifeMate private-test image, laid out as the organizers' guide asks (Docker_Guide_ZAC2026_LifeMate.pdf):
 #   /code/predict.sh  /code/flags.sh  /code/README.md  /code/requirements.txt  /code/src/lifemate (inference code)
-#   /code/models/{llm_base,lora,gipformer}  /code/predict_notebook.ipynb  /code/start_jupyter.sh  /code/training_code
+#   /code/models/{llm_base,llm-lora-p1,llm-lora-e1,llm-lora-synth,asr-gipformer}  /code/predict_notebook.ipynb  /code/start_jupyter.sh
+#   /code/training_code
 #   /code/configs/release.sh (model and agent settings shared with local runs; sourced by flags.sh)
-# Build from the repo root after scripts/setup/get_models.sh and get_checkpoint.sh (the weights are the published release, so the
-# image always matches the checkpoints scored locally; .dockerignore keeps data/ and every other output out of the context):
-#   docker build --platform linux/amd64 -f docker/Dockerfile -t zac2026_lifemate_<team>:v1 .
+# Build with docker/build.sh after scripts/setup/get_models.sh and get_checkpoint.sh: it streams a context with the symlinks
+# resolved (models/qwen3.5-4b is often a link) holding only the code, the base LLM and the release checkpoints, so the image
+# always matches the checkpoints scored locally.
 # Scoring command (guide, section 10):
 #   docker run --rm --gpus '"device=0"' --network none -v /path/to/data:/data:ro -v /path/to/result:/result zac2026_lifemate_<team>:v1 bash /code/predict.sh
 # Base image: vLLM 0.32.0 (the version all runs were made with; it loads Qwen3.5 and runs on A30 and RTX 5090), CUDA <= 13.2.
@@ -16,11 +17,10 @@ WORKDIR /code
 COPY docker/requirements.txt /code/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /code/requirements.txt
 # weights first, so a code change does not invalidate their layers
-# outputs/release/$RELEASE_NAME of configs/release.sh
-ARG RELEASE=outputs/release/lifemate-q35e1
+# base LLM (weights used at inference with the LoRA adapters) and outputs/release/$RELEASE_NAME of configs/release.sh
+ARG RELEASE=outputs/release/lifemate-final
 COPY models/qwen3.5-4b/ /code/models/llm_base/
-COPY ${RELEASE}/llm-lora/ /code/models/lora/
-COPY ${RELEASE}/asr-gipformer-v2/ /code/models/gipformer/
+COPY ${RELEASE}/ /code/models/
 COPY pyproject.toml README.md /code/training_code/
 COPY configs/ /code/training_code/configs/
 COPY scripts/ /code/training_code/scripts/
@@ -29,5 +29,5 @@ COPY src/ /code/training_code/src/
 COPY configs/release.sh /code/configs/release.sh
 COPY docker/README.md docker/predict.sh docker/flags.sh docker/start_jupyter.sh docker/predict_notebook.ipynb /code/
 COPY src/lifemate /code/src/lifemate
-RUN chmod +x /code/predict.sh /code/start_jupyter.sh
+RUN chmod +x /code/predict.sh /code/start_jupyter.sh && python3 -c "import sherpa_onnx, soundfile, jupyterlab, lifemate.docker_predict"
 CMD ["bash", "/code/predict.sh"]

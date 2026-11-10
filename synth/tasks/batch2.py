@@ -1,5 +1,5 @@
 """Tasks for the batch-2 synthetic apps. Anchors: Mon 2026-11-23 20:00 (EVE), Thu 2026-11-19 08:30 (MORN), Sat 2026-11-28 10:00 (SAT)."""
-from _common import ASK, C, CALENDAR, CONTACTS, REMINDERS, SMS, T
+from _common import ASK, C, CALENDAR, CONTACTS, SMS, T
 
 EVE = "2026-11-23T20:00:00+07:00"
 MORN = "2026-11-19T08:30:00+07:00"

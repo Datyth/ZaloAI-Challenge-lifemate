@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Entry point of the image: bash /code/predict.sh (no arguments). Reads /data/<split>, writes /result/submission.jsonl
 # (one line per sample: id, tool_calls, state_hash, time in ms) and /result/logs/ (trace of every sample, vLLM log).
-# 1. start a local vLLM server (loopback only; the container has no network) with the base model and the LoRA adapter
+# 1. start a local vLLM server (loopback only; the container has no network) with the base model and the LoRA adapter(s)
 # 2. run the samples one by one: Gipformer ASR on CPU, then the agent loop on that sample's single ToolEnv
 set -uo pipefail
 cd /code

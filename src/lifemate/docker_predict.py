@@ -1,6 +1,9 @@
 """Private-test inference inside the Docker image (organizers' guide, sections 5 and 10).
 
-    python3 -m lifemate.docker_predict --data /data --out /result [--llm-url http://127.0.0.1:8000/v1/chat/completions --model q35_e1]
+    python3 -m lifemate.docker_predict --data /data --out /result [--llm-url http://127.0.0.1:8000/v1/chat/completions --model lifemate]
+
+Settings come from the LIFEMATE_* variables that docker/flags.sh exports from configs/release.sh (served model, ASR folder,
+deadline, orchestration, retry cap, max turns, optional step-level vote); the defaults below are the release values.
 
 - The split is the folder of /data that holds <split>_tools_catalog.json; zaic_tools is imported from /data/<split>, never from a
   copy in the image, and the agent reads app data only through ToolEnv (one per sample, created once).
@@ -36,12 +39,20 @@ def find_split(root: Path) -> str:
 class Predictor:
     """Loaded resources plus one-sample prediction; used by main() and by predict_notebook.ipynb."""
 
-    def __init__(self, data: Path, llm_url: str, model: str, asr_dir: Path, deadline: float, max_turns: int = 10) -> None:
+    def __init__(self, data: Path, llm_url: str, model: str, asr_dir: Path, deadline: float, max_turns: int | None = None) -> None:
         self.root = data.resolve()
         self.split = find_split(self.root)
         self.specs = catalog(self.root, self.split)
         self.asr = GipformerASR(asr_dir, device="cpu")
-        self.llm = LocalChat(llm_url, model, timeout=deadline)
+        self.orchestration = os.environ.get("LIFEMATE_ORCHESTRATION", "E1P")
+        self.retry_cap = int(os.environ.get("LIFEMATE_RETRY_CAP", "2"))
+        max_turns = max_turns or int(os.environ.get("LIFEMATE_MAX_TURNS", "10"))
+        ensemble = os.environ.get("LIFEMATE_ENSEMBLE", "").strip()
+        if ensemble:   # step-level vote of several served LoRAs on the one ToolEnv (lifemate.ensemble); first member breaks ties
+            from .ensemble import EnsembleChat
+            self.llm = EnsembleChat(llm_url, [tuple(m.split(":", 1)) for m in ensemble.split(",")], timeout=deadline)
+        else:
+            self.llm = LocalChat(llm_url, model, timeout=deadline)
         self.deadline, self.max_turns = deadline, max_turns
         self.failed: list[str] = []                       # ids whose agent loop raised; their lines keep the calls made
 
@@ -62,8 +73,12 @@ class Predictor:
         try:
             transcript = transcribe(item["audio"])
             view = {key: item[key] for key in ("id", "audio", "context", "history")}
+            if hasattr(self.llm, "bind"):
+                self.llm.bind(view, transcript, installed_tools(view, self.specs))
+                self.llm.last_votes = []
             execute(view, transcript, installed_tools(view, self.specs), env, self.llm, transcribe, log, max_turns=self.max_turns,
-                    deadline_seconds=self.deadline - (time.perf_counter() - t1), orchestration="E1", dedup_calls=True)
+                    deadline_seconds=self.deadline - (time.perf_counter() - t1), orchestration=self.orchestration, dedup_calls=True,
+                    retry_cap=self.retry_cap)
         except Exception as exc:  # the line is still written from the ToolEnv
             self.failed.append(item["id"])
             log("error", {"sample_id": item["id"], "error": f"{type(exc).__name__}: {exc}"})
@@ -78,13 +93,15 @@ def main() -> None:
     ap.add_argument("--model", default=os.environ.get("LIFEMATE_SERVED_MODEL", "lifemate"))
     ap.add_argument("--asr-dir", type=Path, default=Path(os.environ.get("LIFEMATE_ASR_DIR", "/code/models/gipformer")))
     ap.add_argument("--deadline", type=float, default=float(os.environ.get("LIFEMATE_DEADLINE", "27")), help="seconds per sample, ASR included")
-    ap.add_argument("--max-turns", type=int, default=10)
+    ap.add_argument("--max-turns", type=int, default=int(os.environ.get("LIFEMATE_MAX_TURNS", "10")))
     ap.add_argument("--limit", type=int, help="first N samples only (smoke test)")
     a = ap.parse_args()
     random.seed(42)
     t_load = time.perf_counter()
     pred = Predictor(a.data, a.llm_url, a.model, a.asr_dir, a.deadline, a.max_turns)
-    print(f"lifemate: split {pred.split}, ASR loaded in {time.perf_counter() - t_load:.1f}s, LLM {a.model} at {a.llm_url}", flush=True)
+    llm = f"vote {os.environ['LIFEMATE_ENSEMBLE']}" if os.environ.get("LIFEMATE_ENSEMBLE") else f"LLM {a.model}"
+    print(f"lifemate: split {pred.split}, ASR loaded in {time.perf_counter() - t_load:.1f}s, {llm} at {a.llm_url}, "
+          f"orchestration {pred.orchestration}, retry cap {pred.retry_cap}", flush=True)
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "logs").mkdir(exist_ok=True)
     selected = pred.samples()[: a.limit] if a.limit else pred.samples()

@@ -1,5 +1,5 @@
 """Tasks: hotel_booking, clinic. Time anchor Thursday 2026-11-12 unless stated."""
-from _common import ASK, C, CONTACTS, REMINDERS, SMS, CALENDAR, T
+from _common import ASK, C, CONTACTS, REMINDERS, SMS, T
 
 NOW = "2026-11-12T09:00:00+07:00"
 HOTEL = {"hotels": [

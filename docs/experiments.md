@@ -1,4 +1,4 @@
-# Nhật ký thí nghiệm và quyết định (04–08/11/2026)
+# Nhật ký thí nghiệm và quyết định (04–10/11/2026)
 
 Gộp từ các báo cáo cũ (orchestration, ASR benchmark, SFT, Gipformer SFT, cải tiến 07/11, nghiên cứu 08/11). Phân tích lỗi chi
 tiết của bản tốt nhất ở [error_analysis.md](error_analysis.md); luật thi ở [competition.md](competition.md).
@@ -10,7 +10,7 @@ tiết của bản tốt nhất ở [error_analysis.md](error_analysis.md); lu�
   cáo dùng số câu khớp state và "exact-call F1", không so trực tiếp được với điểm này.
 - Chênh lệch dưới khoảng 1,5 điểm trên val là nhiễu (xem mục Tính tất định).
 
-## Bản đang dùng (public 58,02, 08/11)
+## Bản 08/11 (public 58,02); bản release ở mục 7
 
 Gipformer ASR v2 (CPU, modified beam search, beam 4, chữ thường) → Qwen3.5-4B + LoRA `q35_e1` trong vLLM → vòng agent E1,
 `--dedup-calls`, tối đa 10 lượt. Val: **70,91** với ASR v2, **82,33** với transcript chuẩn. Cấu hình nằm ở `configs/release.sh`.
@@ -25,6 +25,9 @@ Gipformer ASR v2 (CPU, modified beam search, beam 4, chữ thường) → Qwen3.
 | q35 + dữ liệu app tổng hợp | 69,13 | 56,69 |
 
 ## 1. Orchestration (04–05/11, Qwen3-ASR-0.6B + Qwen3-4B-Instruct-2507, chưa SFT)
+
+Các chế độ E0, E2, E3, E6, O1–O5 và S2 dưới đây đã gỡ khỏi `src/lifemate/agent.py` ngày 10/11 (còn trong lịch sử git); code
+hiện giữ E1, E1D và E1P.
 
 - **E0–E3** trên 200 câu val, cùng checkpoint. Kết quả: khớp state E0 49, **E1 52**, E2 52 (4 câu lỗi), E3 51. F1 E0 0,143,
   **E1 0,240**.
@@ -61,8 +64,7 @@ Gipformer ASR v2 (CPU, modified beam search, beam 4, chữ thường) → Qwen3.
 - **Hotword** (sherpa-onnx biasing):
   - +2,2 val với ASR gốc;
   - với ASR v2 thì chèn sai nhiều (WER 11,09%), nên **không dùng**.
-- **ITN** (số đọc → chữ số, `src/lifemate/itn.py`): +0,6, trong mức nhiễu. Không dùng; chỉ còn được `analysis/ground_numbers.py`
-  dùng.
+- **ITN** (số đọc → chữ số): +0,6, trong mức nhiễu. Không dùng; code đã gỡ khỏi repo ngày 10/11 (còn trong lịch sử git).
 - **ASR trên CPU** (8 luồng): 0,07 s mỗi file, transcript trùng bản GPU 150/150. Docker chạy ASR trên CPU, GPU dành cho vLLM.
 
 ## 3. SFT LLM
@@ -91,8 +93,8 @@ Gipformer ASR v2 (CPU, modified beam search, beam 4, chữ thường) → Qwen3.
 - **`--ground-args`** (ID không x-ref phải có căn cứ; bỏ tham số tùy chọn chỉ chép từ context):
   - +1,2 trên app lạ, 0 trên val;
   - public 48,15 so với 48,18;
-  - không bật trong release.
-- **Luật "số không căn cứ thì hỏi lại"** (`analysis/ground_numbers.py`): +0,2. Không dùng, vì nhiều giá trị đúng là kết quả tính
+  - không bật trong release; code đã gỡ ngày 10/11 (còn trong lịch sử git).
+- **Luật "số không căn cứ thì hỏi lại"**: +0,2. Không dùng, vì nhiều giá trị đúng là kết quả tính
   toán chứ không chép nguyên văn.
 - **Dữ liệu app tổng hợp** (`synth/`, `scripts/data/build_synth_split.py`; 27 app, 164 task, không trùng miền với app chỉ có ở
   public):
@@ -116,3 +118,43 @@ Gipformer ASR v2 (CPU, modified beam search, beam 4, chữ thường) → Qwen3.
 3. **Bản cuối train trên toàn TRAIN** (thêm 200 câu val), thử 3 epoch bằng giao thức LAO trước.
 4. **Không làm**: thêm luật hậu xử lý, hotword toàn cục với ASR v2, đổi tên app, thinking mode khi chưa có speculative decoding,
    train ít epoch hơn.
+
+## 7. Từ 09/11 đến bản release (public 61,26)
+
+Báo cáo chi tiết: [training_audit_2026-11-09.md](training_audit_2026-11-09.md),
+[research_bottlenecks_2026-11-09.md](research_bottlenecks_2026-11-09.md).
+
+- **Prompt E1D, E1P** (`src/lifemate/agent.py`). E1 không cho thứ trong tuần: trên public 5/13 câu "thứ X tuần sau" ra sai ngày.
+  E1D thêm bảng 15 ngày có tên thứ (model gốc với transcript chuẩn: val 40,0 → 45,1). E1P thêm tên tiếng Việt và mô tả của
+  từng app (lấy từ catalog) cùng 4 gợi ý chung khi tìm kiếm ra rỗng, viết bằng app của TRAIN.
+- **Dữ liệu recovery** (`scripts/data/inject_recovery.py`): nhãn TRAIN gần như không có lần tìm ra rỗng, nên model chưa từng
+  học bước sửa. 92 quỹ đạo chèn một lần tìm sai (danh xưng, tên nghe sai, từ khoá quá dài) đã chạy trong ToolEnv và ra rỗng,
+  không tính loss, rồi tới lần tìm đúng.
+- **Loss có trọng số** (`--fuzzy-weight 0.3`): trường chữ tự do (x-match fuzzy) chiếm 4–6% token được train nhưng 42–66% loss
+  trên câu chưa thấy (`analysis/token_loss.py`).
+- **Retry cap** (`--retry-cap 2`): sau recovery, model có lúc tìm mãi (một câu đặt vé: 10 lời gọi); chặn tool đọc đã ra rỗng 2 lần.
+- **p1** = toàn bộ task + E1P + recovery x2 + trọng số 0,3: val 69,55 (q35_e1: 70,91), public 57,65 (58,02).
+- **ASR v3**: nhãn số viết theo cách đọc (giữ 368/368 câu có số, v2 bỏ 112), augmentation tốc độ / nhiễu / SpecAugment, 3 epoch:
+  WER 8,66 → 7,74, val end to end 70,91 → 71,87. **ASR v4** thêm 1.202 câu TTS (VieNeu, giọng nhân bản từ audio TRAIN, tên và số
+  mới): nghe đúng thêm cụm từ khoá (155 → 159/221) nhưng end to end 68,64, nên bản cuối **không dùng TTS**.
+- **Bản cuối train trên toàn bộ dữ liệu** (kể cả 200 câu val): ASR final (5.036 recording) và adapter p1, e1, synth
+  (`scripts/data/build_final_data.sh`, `scripts/train/train_final.sh`). Không còn val cho các model này.
+  - **p1 + ASR final: public 61,26** (+3,24 so với 58,02). Đây là bản release.
+  - Bỏ phiếu theo từng bước của p1, e1, synth trên một ToolEnv (`src/lifemate/ensemble.py`; trên val với các bản cũ: 70,91 →
+    72,71): 90/634 câu có hash khác bản 61,26; file `result/submission_ens3full_asrfinal_20261110.jsonl`, chưa có điểm public.
+- **Đường chạy của Docker** (`scripts/infer/docker_local.sh`, chính `lifemate.docker_predict`) trên 634 câu public: 618/634
+  câu cùng trạng thái cuối với file 61,26 (xem bảng thời gian dưới).
+
+### Thời gian mỗi mẫu
+
+| 634 câu public, một luồng, một RTX PRO 4000 Blackwell (24 GB) | Giá trị |
+| --- | ---: |
+| Nạp model (vLLM khởi động tới sẵn sàng) | khoảng 45 s |
+| Thời gian trung bình mỗi câu, gồm ASR | 2,88 s |
+| Câu lâu nhất | 8,71 s |
+| Số câu quá 30 s | 0 |
+| Cùng trạng thái cuối với file 61,26 | 618 / 634 |
+
+Giải mã greedy trong vLLM không trùng từng bit giữa các lượt: cách gộp batch (file 61,26 chạy 4 luồng song song) và trạng thái prefix
+cache làm vài lựa chọn sát nút đổi đi. Hai lượt chạy một luồng trên cùng 100 câu public trùng 97 câu; ở 3 câu còn lại, model nhận
+prompt y hệt nhưng chọn số tiền khác ở một lượt. Khi kết quả chạy lại khác, luật Track 1 lấy trung bình 5 lần chạy của BTC.

@@ -9,7 +9,7 @@ cd "$(dirname "$0")/../.."
 source configs/release.sh
 prefix=$1; ids=$2; shards=$3; source=$4; model=$5; orch=${6:-}; port=${7:-8000}
 split=${SPLIT:-train}
-asr_dir=${ASR_DIR:-models/gipformer-lm-v2-01}
+asr_dir=${ASR_DIR:-outputs/release/$RELEASE_NAME/$ASR_DIRNAME}
 # Transcripts written by scripts/infer/asr_cache.py with $asr_dir: <name>_val (validation ids) or <name>_public (public_test).
 suffix=val; [ "$split" = public_test ] && suffix=public
 cache=${CACHE:-outputs/asr/$(basename "$asr_dir")_$suffix/asr_outputs.jsonl}
@@ -21,14 +21,14 @@ ids = [json.loads(l)["id"] for l in open(split_file, encoding="utf-8") if l.stri
 for k in range(n):
     json.dump(ids[k::n], open(f"outputs/splits/shards/{prefix}_s{k}.json", "w"))
 PY
-# DEADLINE 900: four local shards share one GPU (the 58.02 run); the Docker image uses 27 s on its own GPU.
+# DEADLINE 900: four local shards share one GPU; the Docker image uses 27 s per sample, one sample at a time.
 args=(--split "$split" --allow-failures --deadline "${DEADLINE:-900}" --llm-url "http://127.0.0.1:${port}/v1/chat/completions" "${AGENT_FLAGS[@]}")
 [ -n "$orch" ] && args+=(--orchestration "$orch")
 if [ "$source" = asr ]; then
   [ -f "$cache" ] || { echo "missing ASR cache $cache (scripts/infer/asr_cache.py) or set CACHE" >&2; exit 1; }
   args+=(--transcript-source cached-asr --transcripts-jsonl "$cache" --asr-dir "$asr_dir")
 else args+=(--transcript-source train-reference); fi
-if [ "$model" = sft ]; then args+=(--adapter-dir "${ADAPTER:-outputs/release/$RELEASE_NAME/llm-lora}" --llm-served-model "${SERVED:-$LORA_NAME}"); fi
+if [ "$model" = sft ]; then args+=(--adapter-dir "${ADAPTER:-outputs/release/$RELEASE_NAME/$LORA_DIRNAME}" --llm-served-model "${SERVED:-$LORA_NAME}"); fi
 # extra flags, e.g. EXTRA="--max-turns 12"
 if [ -n "${EXTRA:-}" ]; then read -r -a extra <<< "$EXTRA"; args+=("${extra[@]}"); fi
 pids=()

@@ -1,129 +1,248 @@
-# LifeMate (Zalo AI Challenge 2026, track 1)
+<div align="center">
 
-Speech request → tool calls on the organizer's `ToolEnv`. The released pipeline (public **58.02**, 2026-11-08):
+<img src="docs/assets/banner.svg" alt="LifeMate: spoken Vietnamese requests turned into verified tool calls" width="100%">
 
-1. **ASR.** Gipformer 1.5 (68M RNN-T), fine-tuned on the TRAIN audio ("ASR v2"). It runs on CPU with sherpa-onnx (modified beam
-   search, beam 4), and its output is lower-cased.
-2. **LLM.** Qwen3.5-4B (text layers only, non-thinking) with the QLoRA adapter `q35_e1`, served by a local vLLM 0.32.0.
-3. **Agent.** The E1 loop (`src/lifemate/agent.py`) runs on the sample's single ToolEnv.
-   - The model sees structured read-only history.
-   - Every proposed call is schema-validated before it is executed.
-   - An identical call is never executed twice (`--dedup-calls`).
-   - The loop stops after at most 10 LLM turns.
+<p>
+  <a href="#results"><img alt="Public score" src="https://img.shields.io/badge/public%20score-61.26-2ea44f"></a>
+  <a href="https://challenge.zalo.ai"><img alt="Zalo AI Challenge 2026" src="https://img.shields.io/badge/Zalo%20AI%20Challenge-2026%20Track%201-0068FF"></a>
+  <img alt="Python 3.12" src="https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white">
+  <img alt="vLLM 0.32.0" src="https://img.shields.io/badge/vLLM-0.32.0-30A2FF">
+  <img alt="LLM" src="https://img.shields.io/badge/LLM-Qwen3.5--4B%20%2B%20LoRA-7B3FE4">
+  <img alt="ASR" src="https://img.shields.io/badge/ASR-Gipformer%2068M-E07A1F">
+  <a href="#docker-submission"><img alt="Docker" src="https://img.shields.io/badge/docker-offline%20image-2496ED?logo=docker&logoColor=white"></a>
+  <a href="https://huggingface.co/hugebenevolence/lifemate-final"><img alt="Checkpoints" src="https://img.shields.io/badge/%F0%9F%A4%97%20checkpoints-lifemate--final-FFD21E"></a>
+</p>
 
-Validation on 200 frozen TRAIN ids: **70.91** with ASR, **82.33** with gold transcripts. All model and agent settings are in
-[`configs/release.sh`](configs/release.sh), which the local server, the local runs and the Docker image all source.
+<p>
+  <a href="#quick-start">Quick start</a> &nbsp;|&nbsp;
+  <a href="#results">Results</a> &nbsp;|&nbsp;
+  <a href="#reproduce-the-release">Reproduce</a> &nbsp;|&nbsp;
+  <a href="#docker-submission">Docker</a> &nbsp;|&nbsp;
+  <a href="docs/experiments.md">Experiment log</a>
+</p>
 
-The docs are:
-- [docs/competition.md](docs/competition.md): rules, scoring, limits and the Docker contract;
-- [docs/experiments.md](docs/experiments.md): results and decisions;
-- [docs/error_analysis.md](docs/error_analysis.md): error analysis of the release, with the figure in `docs/figures/pipeline.png`;
-- [docker/README.md](docker/README.md): the submission image.
+</div>
 
-## Layout
+LifeMate listens to a Vietnamese voice request and acts on the user's apps: it calls the right tools, in the right order, on
+the organizer's `ToolEnv` sandbox, and it asks back or does nothing when that is the correct answer. This repository holds the
+team's full solution to Track 1 of the Zalo AI Challenge 2026: inference, training, data pipelines, analyses and the offline
+Docker image.
 
-| Path | Content |
-| --- | --- |
-| `src/lifemate/` | Inference package: `cli` (evaluate / submit / validate), `docker_predict` (image entry), `agent`, `asr`, `llm`, `toolenv`, `submission` |
-| `configs/` | `release.sh` (release settings), `splits/validation_ids.json` (frozen 200 TRAIN ids) |
-| `scripts/setup/` | Download base models and the release checkpoints; build the ASR training env |
-| `scripts/data/` | Validation split, agent SFT data, Gipformer SFT data, synthetic-app split |
-| `scripts/train/` | Agent QLoRA SFT, Gipformer fine-tuning and ONNX export |
-| `scripts/infer/` | vLLM server, sharded evaluation, ASR transcript cache, submission merge |
-| `analysis/` | Local scorer (`score.py`) and error analyses |
-| `synth/` | Synthetic apps and tasks (tried, not in the release) |
-| `docker/` | Submission image |
-| `tests/` | Unit tests (`python -m pytest`; the tests that need the kit skip without `data/`) |
+<p align="center">
+  <img src="docs/figures/pipeline_v3.png" alt="Pipeline: Gipformer ASR, Qwen3.5-4B with LoRA, checked calls on one ToolEnv" width="100%">
+</p>
 
-`data/`, `models/`, `outputs/` and `result/` are git-ignored. The organizer kit goes to `data/train+public_test/`.
+## Highlights
 
-## Setup
+- **61.26 on the public test**, from a 30.77 first baseline, with every model trained only on the organizer's TRAIN split.
+- **Small and fast.** 4.31B parameters in total (limit 6B), about 3 s per request on one 24 GB GPU, fully offline.
+- **Safe by construction.** Every proposed call is checked (schema, IDs seen before, no repeats, bounded retries) before it
+  reaches the single `ToolEnv` of the sample, because every executed call is scored.
+- **Reproducible end to end.** One script rebuilds all training data (checked byte for byte against the released data), one
+  script retrains every checkpoint, and the released weights ship with SHA-256 sums.
+
+## Contents
+
+- [How it works](#how-it-works)
+- [Results](#results)
+- [Quick start](#quick-start)
+- [Reproduce the release](#reproduce-the-release)
+- [Evaluate a change](#evaluate-a-change)
+- [Docker submission](#docker-submission)
+- [Repository layout](#repository-layout)
+- [Rules we follow](#rules-we-follow)
+- [Acknowledgements](#acknowledgements)
+
+## How it works
+
+| Stage | What runs | Key choices |
+| --- | --- | --- |
+| ASR | [Gipformer 1.5](https://huggingface.co/g-group-ai-lab/gipformer1.5-68M-rnnt) (68M RNN-T), fine-tuned on all TRAIN audio, ONNX on CPU with sherpa-onnx | numbers spelled the way they are spoken; speed, noise and SpecAugment augmentation; word error rate 15.2% to 7.7% |
+| Prompt | rules, read-only history, the request with its context | weekday calendar for relative dates; Vietnamese name and description of each installed app; hints for empty searches |
+| LLM | [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) (text layers, non-thinking, greedy) + LoRA r16, served by vLLM | trained on replayed TRAIN trajectories with gold and ASR transcripts, loss only on the model's own decisions |
+| Agent loop | one call per turn, at most 10 turns, on the sample's single `ToolEnv` | schema and `x-ref` checks, no identical call twice, a search that came back empty twice is blocked |
+| Output | `env.get_tool_calls()` and `env.get_state_hash()` | a question back (`sys.ask_missing_info`) or an empty list are answers too |
+
+An optional step-level vote of three adapters (`ENSEMBLE` in [`configs/release.sh`](configs/release.sh)) lets all three
+propose each call and runs only the majority call on the same `ToolEnv`, which keeps the one-environment rule.
+
+Every model and agent setting lives in [`configs/release.sh`](configs/release.sh); the local server, the local runs and the
+Docker image all source it.
+
+## Results
+
+Scores are the organizer's metric (final state must match, then F1 of the calls), times 100. Validation is 200 frozen TRAIN
+samples kept out of training ([`configs/splits/validation_ids.json`](configs/splits/validation_ids.json)); it runs about
+13 points above the public test because every validation app also appears in training.
+
+| Submission | Validation | Public |
+| --- | ---: | ---: |
+| Original Gipformer + Qwen3-4B LoRA (first baseline) | 36.4 | 30.77 |
+| ASR text lower-cased | 44.0 | 38.80 |
+| Fine-tuned Gipformer, trajectory SFT, no repeated calls | 60.0 | 48.18 |
+| Qwen3.5-4B LoRA `e1` | 70.91 | 58.02 |
+| `p1` recipe: E1P prompt, recovery rows, weighted loss | 69.55 | 57.65 |
+| **Release: `p1` on all data + final ASR** | (trained on it) | **61.26** |
+
+The release, run through the Docker image's code path ([`scripts/infer/docker_local.sh`](scripts/infer/docker_local.sh)) on
+the 634 public samples:
+
+| 634 public samples, one stream, one RTX PRO 4000 Blackwell (24 GB) | Value |
+| --- | ---: |
+| Model loading (vLLM start to ready) | about 45 s |
+| Mean time per sample, ASR included | 2.88 s |
+| Slowest sample | 8.71 s |
+| Samples over the 30 s limit | 0 |
+| Same final state as the submitted 61.26 file | 618 / 634 |
+
+Greedy decoding is not bit-exact across runs in vLLM: batching (the 61.26 file used four parallel streams) and prefix-cache state
+change a few low-margin choices. Two single-stream runs of the same 100 public samples agreed on 97; in the 3 others the model got
+the identical prompt and picked a different amount at one turn. The Track 1 rules average five organizer runs in that case.
+
+More numbers and every decision: [docs/experiments.md](docs/experiments.md), [docs/error_analysis.md](docs/error_analysis.md).
+
+## Quick start
+
+**Requirements:** Linux, one NVIDIA GPU with 24 GB, Python 3.12, [uv](https://docs.astral.sh/uv/), and the organizer kit in
+`data/train+public_test/` (it is not redistributed here).
 
 ```bash
 uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -e '.[infer,test]'
-bash scripts/setup/get_models.sh      # Qwen3.5-4B and the original Gipformer at pinned revisions -> models/
-bash scripts/setup/get_checkpoint.sh  # release LoRA + ASR v2 (private HF repo, `hf auth login`) -> outputs/release/lifemate-q35e1/
-.venv/bin/python scripts/data/make_validation_split.py   # writes configs/splits/validation_ids.json, or checks it if present
+bash scripts/setup/get_models.sh       # Qwen3.5-4B and the original Gipformer, pinned revisions -> models/
+bash scripts/setup/get_checkpoint.sh   # released checkpoints, checked against SHA256SUMS -> outputs/release/lifemate-final/
+
+bash scripts/infer/serve.sh                                          # terminal 1: vLLM on 127.0.0.1:8000
+bash scripts/infer/docker_local.sh public_test outputs/pub_release   # terminal 2: predict like the Docker image
 ```
 
-The training environments are separate:
-- `.venv-train` for agent SFT: `uv pip install -e '.[sft]'`;
-- `.venv-asr` for Gipformer fine-tuning with torch 2.8, k2, kaldifeat and icefall: `bash scripts/setup/setup_asr_env.sh`.
-
-## Evaluate
+`docker_local.sh` writes `outputs/pub_release/submission.jsonl` (one line per sample with `id`, `tool_calls`, `state_hash`,
+`time`) and a trace of every turn in `outputs/pub_release/logs/trace.jsonl`. Check a file with the organizer's validator:
 
 ```bash
-bash scripts/infer/serve.sh            # terminal 1: vLLM on 127.0.0.1:8000, base + release LoRA served as "lifemate"
-# terminal 2: ASR transcripts of the validation samples (CPU), then 4 parallel shards of the agent, then the score
+PYTHONPATH=data/train+public_test/public_test .venv/bin/python -m zaic_tools --split public_test \
+  --root data/train+public_test --validate outputs/pub_release/submission.jsonl
+```
+
+| Download | Source |
+| --- | --- |
+| Base LLM | [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) @ `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` (Apache-2.0) |
+| Base ASR | [g-group-ai-lab/gipformer1.5-68M-rnnt](https://huggingface.co/g-group-ai-lab/gipformer1.5-68M-rnnt) @ `dd9227dcd8705c13f33bdbe59728d546ab94480f` |
+| Released checkpoints | [hugebenevolence/lifemate-final](https://huggingface.co/hugebenevolence/lifemate-final): `asr-gipformer/`, `llm-lora-p1/`, `llm-lora-e1/`, `llm-lora-synth/`, `SHA256SUMS` |
+
+## Reproduce the release
+
+Two more environments are needed for training:
+
+```bash
+uv venv .venv-train --python 3.12 && uv pip install --python .venv-train/bin/python -e '.[sft]'   # LLM adapters
+bash scripts/setup/setup_asr_env.sh                                                                # .venv-asr: torch 2.8, k2, icefall
+```
+
+Then three commands rebuild everything the release was trained on, retrain it and package it:
+
+```bash
+bash scripts/data/build_final_data.sh   # all training data, ~30 min on CPU
+bash scripts/train/train_final.sh all   # ASR, then the adapters p1, e1, synth (~16 h on one 24 GB GPU)
+                                        # ends with scripts/train/build_release.sh -> outputs/release/lifemate-final/
+```
+
+| Training set | Rows | Content |
+| --- | ---: | --- |
+| `outputs/asr_sft/asr_full` | 5,036 | every TRAIN recording with its transcript |
+| `outputs/sft/data_full_p1` | 3,274 | E1P trajectories of all 1,545 tasks with gold and ASR transcripts, plus 92 recovery rows twice |
+| `outputs/sft/data_full_e1` | 3,090 | E1 trajectories with gold and ASR transcripts |
+| `outputs/sft/data_full_synth` | 3,746 | `data_full_e1` plus trajectories on synthetic apps, twice |
+
+<details>
+<summary>How a training trajectory is built</summary>
+
+- The gold calls of a TRAIN sample are replayed in `ToolEnv`; every result must equal the label and the final call list must
+  equal the gold list ([`scripts/data/prepare_agent_sft.py`](scripts/data/prepare_agent_sft.py)).
+- The conversation uses the exact prompt and message format of inference.
+- The "ASR copy" replaces the user's words (request and history turns) with the original Gipformer's transcript, so the model
+  learns from real recognition errors on audio that ASR never trained on.
+- Recovery rows ([`scripts/data/inject_recovery.py`](scripts/data/inject_recovery.py)) put a failed search (an honorific in the
+  name, a misheard name, or an over-long query) before the right one. The failed search runs in `ToolEnv`, must return nothing,
+  and carries no loss: the model learns the recovery, not the mistake.
+- Loss falls only on the assistant turns (calls, arguments, the decision to stop), with weight 0.3 on free-text message fields,
+  which the metric checks only loosely.
+
+</details>
+
+| Checkpoint | Settings (seed 42) | Time |
+| --- | --- | ---: |
+| `asr-gipformer` | all 68M parameters, 3 epochs, lr 2e-5, accum 4, number targets from their value, augmentation, last checkpoint | ~1 h |
+| `llm-lora-p1` | LoRA r16 / alpha 32 on attention and MLP, 2 epochs, lr 1e-4, batch 1 x accum 8, max length 16,384, bf16 base, message weight 0.3 | ~5.6 h |
+| `llm-lora-e1` | same LoRA on the 4-bit base (QLoRA), plain loss | ~4.3 h |
+| `llm-lora-synth` | as `e1`, on `data_full_synth` | ~5.1 h |
+
+Versions used for the released weights: `unsloth 2026.10.11`, `trl 1.15.0`, `peft 0.21.2`, `transformers 5.17.0`,
+`torch 2.14.1` (LLM); `torch 2.8.0`, `k2 1.24.4`, icefall (ASR). The `sft` extra of [`pyproject.toml`](pyproject.toml) pins them.
+
+## Evaluate a change
+
+The released models were trained on every TRAIN sample, so they cannot be scored on the validation split. To test a change,
+train the same recipe without the 200 validation tasks (drop `--include-validation` / `--final`) and compare on them:
+
+```bash
 .venv/bin/python scripts/infer/asr_cache.py --split train --ids configs/splits/validation_ids.json \
-  --model-dir models/gipformer-lm-v2-01 --output-dir outputs/asr/gipformer-lm-v2-01_val
-bash scripts/infer/run_shards.sh v200 configs/splits/validation_ids.json 4 asr sft
+  --model-dir <asr folder> --output-dir outputs/asr/<name>_val
+bash scripts/infer/run_shards.sh v200 configs/splits/validation_ids.json 4 asr sft            # ADAPTER, SERVED, CACHE override
 bash scripts/infer/run_shards.sh v200_oracle configs/splits/validation_ids.json 4 oracle sft   # gold transcripts
 .venv/bin/python analysis/score.py outputs/runs/v200 outputs/runs/v200_oracle
-.venv/bin/python analysis/errors.py --asr v200 --oracle v200_oracle    # error groups and per-case files
 ```
 
-`run_shards.sh` exits non-zero if any shard fails. You can override its defaults through the environment:
-- `ADAPTER` / `SERVED` for another LoRA;
-- `CACHE` for another transcript file;
-- `DEADLINE` (default 900 s, because the shards share one GPU);
-- `EXTRA` for more `lifemate.cli evaluate` flags.
+Validation predicts the public score for ASR and base-model changes, but not for changes in agent behaviour: 45% of public
+requests use an app that never appears in TRAIN. Test those by hiding some TRAIN apps from training
+([docs/experiments.md](docs/experiments.md), section 4).
 
-To compare adapters, serve them side by side with `bash scripts/infer/serve.sh name=dir ...`.
+## Docker submission
 
-## Submit (public test)
+The image follows the organizer's guide: `/code/predict.sh` (no arguments) reads `/data/<split>` and writes
+`/result/submission.jsonl` with a `time` field per sample, `/code/predict_notebook.ipynb` runs the same steps cell by cell for
+timing, and `/code/training_code/` holds this repository. The image's README is [docker/README.md](docker/README.md).
 
 ```bash
-.venv/bin/python scripts/infer/asr_cache.py --split public_test --model-dir models/gipformer-lm-v2-01 \
-  --output-dir outputs/asr/gipformer-lm-v2-01_public
-SPLIT=public_test bash scripts/infer/run_shards.sh pub all 4 asr sft
-.venv/bin/python scripts/infer/merge_submission.py pub --split public_test --output result/submission.jsonl
-PYTHONPATH=data/train+public_test/public_test .venv/bin/python -m zaic_tools --split public_test \
-  --root data/train+public_test --validate result/submission.jsonl
+TEAM=<team> bash docker/build.sh build    # needs Docker access and the NVIDIA runtime
+TEAM=<team> bash docker/build.sh test     # predict.sh on the public test, --network none -> result_docker/
+TEAM=<team> bash docker/build.sh export   # zac2026_<team>.tar.gz and its MD5
 ```
 
-`merge_submission.py` refuses to write in these cases:
-- a shard is unfinished;
-- an id is missing or duplicated;
-- a sample failed at runtime (`runtime_errors.jsonl`), unless you pass `--allow-failures`;
-- the merged file does not replay through ToolEnv to the same hashes.
+`build` streams only the code, the base LLM and `outputs/release/lifemate-final` into the build, with symlinks resolved. The
+base image is `vllm/vllm-openai:v0.32.0`, within the organizer's CUDA 13.2 limit.
 
-It also never overwrites an existing file.
+## Repository layout
 
-The Docker path (`lifemate.docker_predict`) decodes the audio inline and gave rows identical to the cached run (12/12). It needs a
-folder that holds only one split:
-
-```bash
-mkdir -p /tmp/pub && ln -sfn "$PWD/data/train+public_test/public_test" /tmp/pub/public_test
-source configs/release.sh && PYTHONPATH=src .venv/bin/python -m lifemate.docker_predict --data /tmp/pub --out /tmp/pub_out \
-  --asr-dir models/gipformer-lm-v2-01
+```
+configs/          release.sh (every model and agent setting), splits/validation_ids.json
+src/lifemate/     agent loop and prompts, ASR, LLM client, step-level vote, ToolEnv access, Docker entry, CLI
+scripts/setup/    base models, released checkpoints (download, upload), ASR training environment
+scripts/data/     build_final_data.sh, trajectories, recovery rows, ASR pairs, synthetic apps, TTS text
+scripts/train/    train_final.sh, LLM LoRA SFT, Gipformer fine-tuning and ONNX export, build_release.sh
+scripts/infer/    vLLM server, sharded evaluation, ASR cache, submission merge, docker_local.sh, file comparison
+analysis/         local scorer and the analyses behind the decisions
+synth/            synthetic apps and tasks (training data of the synth adapter)
+docker/           Dockerfile, predict.sh, flags.sh, predict_notebook.ipynb, start_jupyter.sh, build.sh, README.md
+docs/             competition rules, experiment log, error analysis, dated reports, figures
+tests/            python -m pytest (tests that need the kit skip without data/)
 ```
 
-To build and run the image, see [docker/README.md](docker/README.md).
+`data/`, `models/`, `outputs/` and `result/` are git-ignored.
 
-## Train
+## Rules we follow
 
-The 200 validation ids, and every sample that shares a history recording with them, are excluded from all training data. Each
-data script records the sha256 of `configs/splits/validation_ids.json` in its manifest.
+- Only the TRAIN split is used for training. Public and private inputs are never labelled or trained on, and no prompt rule or
+  check names an app that only appears in the test sets.
+- One `ToolEnv` per sample, created once. App data is reached only through `validate`, `call`, `get_tool_calls` and
+  `get_state_hash`; the environment files are never read.
+- Inference is offline. Every base model is public and was released before 2026-10-26.
 
-**Agent adapter (`q35_e1`):**
+## Acknowledgements
 
-```bash
-.venv/bin/python scripts/infer/asr_cache.py --split train --output-dir outputs/asr/gipformer_train   # original Gipformer, all TRAIN audio
-.venv/bin/python scripts/data/prepare_agent_sft.py --orchestration E1 --variants gold,asr --output-dir outputs/sft/data_v2_e1
-.venv-train/bin/python scripts/train/train_agent_sft.py --data-dir outputs/sft/data_v2_e1 --out outputs/sft/q35_e1_01 \
-  --model models/qwen3.5-4b --epochs 2 --lr 1e-4    # QLoRA r16, max_len 16384; about 3 h on one 24 GB GPU
-```
+Built on [Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-4B), [Gipformer](https://huggingface.co/g-group-ai-lab/gipformer1.5-68M-rnnt),
+[vLLM](https://github.com/vllm-project/vllm), [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx),
+[icefall](https://github.com/k2-fsa/icefall), [Unsloth](https://github.com/unslothai/unsloth) and
+[VieNeu-TTS](https://huggingface.co/pnnbao-ump/VieNeu-TTS-v3-Turbo) (TTS experiments). Thanks to the Zalo AI Challenge 2026 organizers
+for the data kit and the `zaic_tools` sandbox.
 
-**ASR v2 (`gipformer-lm-v2-01`):**
-
-```bash
-.venv/bin/python scripts/data/prepare_gipformer_sft.py --output-dir outputs/asr_sft/gipformer_data
-.venv-asr/bin/python scripts/train/train_gipformer.py --data-dir outputs/asr_sft/gipformer_data \
-  --output-dir outputs/asr_sft/gipformer_v2 --physical-gpu 0 --train-all   # lr 2e-5, accum 4, 2 epochs (defaults)
-bash scripts/train/export_gipformer.sh outputs/asr_sft/gipformer_v2 gipformer-lm-v2-01   # ONNX + WER on the validation audio
-```
-
-**Synthetic apps (not in the release):**
-- `scripts/data/build_synth_split.py` builds `outputs/synth`;
-- then run `prepare_agent_sft.py --split synth --data-root outputs/synth`.
+Team: Dương Trường Bình, Tô Phát Đạt, Trần Đại Nhân.

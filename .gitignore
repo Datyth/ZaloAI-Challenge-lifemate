@@ -10,3 +10,8 @@ __pycache__/
 *.pptx
 unsloth_compiled_cache/
 docs/portal_*/
+result_docker/
+zac2026_*.tar.gz*
+[[]Slide*]*
+docs/deck/
+downloads/
