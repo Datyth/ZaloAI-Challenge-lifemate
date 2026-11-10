@@ -6,6 +6,7 @@
   <a href="#results"><img alt="Public score" src="https://img.shields.io/badge/public%20score-61.26-2ea44f"></a>
   <a href="https://challenge.zalo.ai"><img alt="Zalo AI Challenge 2026" src="https://img.shields.io/badge/Zalo%20AI%20Challenge-2026%20Track%201-0068FF"></a>
   <img alt="Python 3.12" src="https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
   <img alt="vLLM 0.32.0" src="https://img.shields.io/badge/vLLM-0.32.0-30A2FF">
   <img alt="LLM" src="https://img.shields.io/badge/LLM-Qwen3.5--4B%20%2B%20LoRA-7B3FE4">
   <img alt="ASR" src="https://img.shields.io/badge/ASR-Gipformer%2068M-E07A1F">
@@ -52,6 +53,7 @@ Docker image.
 - [Repository layout](#repository-layout)
 - [Rules we follow](#rules-we-follow)
 - [Acknowledgements](#acknowledgements)
+- [License](#license)
 
 ## How it works
 
@@ -246,3 +248,9 @@ Built on [Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-4B), [Gipformer](https://
 for the data kit and the `zaic_tools` sandbox.
 
 Team: Dương Trường Bình, Tô Phát Đạt, Trần Đại Nhân.
+
+## License
+
+The code is released under the [MIT License](LICENSE). The checkpoints on Hugging Face carry their own terms: the LoRA
+adapters are Apache-2.0, like Qwen3.5, and the fine-tuned ASR keeps Gipformer's MIT licence. The competition data belongs
+to the organizers and is not redistributed here.

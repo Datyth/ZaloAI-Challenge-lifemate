@@ -42,6 +42,9 @@ Code, training data recipes and the Docker image layout: https://github.com/Daty
 The released pipeline serves `llm-lora-p1` alone (public 61.26); the three adapters can also vote on each next call
 (`ENSEMBLE` in `configs/release.sh`). Only the organizer's TRAIN split was used; the public and private test sets were never
 labelled or trained on. `SHA256SUMS` lists every file.
+
+Licences: the LoRA adapters are released under Apache-2.0, like Qwen3.5. `asr-gipformer/` is fine-tuned from Gipformer,
+which is MIT-licensed; its MIT notice applies to that folder. The code is MIT-licensed in the GitHub repository.
 EOF
 (cd "$DEST" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
 du -sh "$DEST"/*
