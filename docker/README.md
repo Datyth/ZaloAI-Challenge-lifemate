@@ -70,7 +70,7 @@ inference; the vision tower in the checkpoint is not loaded.
 - **Real data.** Only the organizer's TRAIN split (1,545 samples). The public and private test sets were never labelled or
   used for training, and no rule or prompt names an app that only appears in the test sets.
 - **ASR.** All 5,036 TRAIN recordings (current requests and history turns). Number labels are written the way they are spoken
-  ("2.500.000" as "hai triệu rưỡi"); speed, noise and SpecAugment augmentation; 3 epochs, lr 2e-5.
+  ("2.500.000" as "hai triệu rưỡi", two and a half million); speed, noise and SpecAugment augmentation; 3 epochs, lr 2e-5.
 - **LLM (`llm-lora-p1`).** Every TRAIN sample becomes a chat trajectory: its gold calls are replayed in `ToolEnv` and must give
   the labelled results. Each sample appears twice, with the gold transcript and with the original Gipformer's transcript (real
   recognition errors on audio that ASR never trained on). 92 "recovery" trajectories add a failed search before the right one;
